@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.tiktoktv"
         minSdk = 22
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
     }
 
     compileOptions {
@@ -21,5 +21,11 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        freeCompilerArgs += "-opt-in=androidx.media3.common.util.UnstableApi"
     }
+}
+
+dependencies {
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.webkit:webkit:1.11.0")
 }
