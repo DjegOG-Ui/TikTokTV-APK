@@ -22,9 +22,9 @@ import android.widget.TextView
 
 class MainActivity : Activity() {
 
-    // Unscharfer Hintergrund bei Hochkant-Videos.
-    // Falls es ruckelt: auf false setzen.
-    private val blurBackground = true
+    // Eigene Oberfläche (Vollbild-Video, Herz/Kommentare/Teilen am Rand).
+    // Bei Problemen auf false setzen: dann wird nur Kopfzeile/Seitenleiste ausgeblendet.
+    private val customUi = true
 
     private lateinit var webView: WebView
     private lateinit var splash: ImageView
@@ -44,54 +44,25 @@ class MainActivity : Activity() {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    // Grundstil: schwarzer Hintergrund, keine Animationen, feste Viewport-Breite
-    private val styleJs = """
-        (function() {
-            var m = document.querySelector('meta[name=viewport]');
-            if (!m) {
-                m = document.createElement('meta');
-                m.name = 'viewport';
-                (document.head || document.documentElement).appendChild(m);
-            }
-            m.content = 'width=1280';
-
-            var css = 'html, body { background:#000 !important; overflow-x:hidden !important; } ' +
-                '::-webkit-scrollbar { display:none !important; } ' +
-                '* { scroll-behavior:auto !important; transition:none !important; animation:none !important; } ' +
-                '#app-header, [class*="DivHeaderContainer"], [class*="DivSideNavContainer"], ' +
-                '[class*="DivSideNavPlaceholder"], [class*="DivBannerContainer"], ' +
-                '[class*="DivAppBanner"], [class*="DivGetAppContainer"], ' +
-                '[class*="DivFooterContainer"] { display:none !important; }';
-            var s = document.getElementById('__tvstyle');
-            if (!s) {
-                s = document.createElement('style');
-                s.id = '__tvstyle';
-                (document.head || document.documentElement).appendChild(s);
-            }
-            s.textContent = css;
-        })();
-    """.trimIndent()
-
-    // Eigene TikTok-Oberfläche für "Für dich" und "Folge ich"
+    // Schlanke Oberfläche: wird einmal eingesetzt, danach nur bei neuem Video aktualisiert
     private val feedJs = """
         (function() {
-            if (window.__tv) { return; }
+            if (window.__tv) { if (window.__tvRoute) { window.__tvRoute(); } return; }
             window.__tv = true;
-            var BLUR = __BLUR__;
+            var CUSTOM = __CUSTOM__;
 
             var css = [
                 'html.__tvon, html.__tvon body { background:#000 !important; overflow:hidden !important; }',
-                'html.__tvon body * { visibility:hidden !important; }',
-                'html.__tvon video.__tvactive { visibility:visible !important; position:fixed !important; ' +
-                    'left:0 !important; top:0 !important; width:100vw !important; height:100vh !important; ' +
-                    'max-width:none !important; max-height:none !important; object-fit:contain !important; ' +
-                    'transform:none !important; z-index:2147483000 !important; background:transparent !important; }',
-                '#__tvbg { position:fixed; left:0; top:0; width:480px; height:270px; object-fit:cover; ' +
-                    'transform-origin:0 0; filter:blur(5px) brightness(0.55); z-index:2147482000; ' +
-                    'pointer-events:none; display:none; }',
+                'html.__tvon #app-header, html.__tvon [class*="DivHeaderContainer"], ' +
+                    'html.__tvon [class*="DivSideNavContainer"], html.__tvon [class*="DivSideNavPlaceholder"], ' +
+                    'html.__tvon [class*="DivBannerContainer"], html.__tvon [class*="DivAppBanner"], ' +
+                    'html.__tvon [class*="DivGetAppContainer"] { display:none !important; }',
+                'video.__tvactive { position:fixed !important; left:0 !important; top:0 !important; ' +
+                    'width:100vw !important; height:100vh !important; max-width:none !important; ' +
+                    'max-height:none !important; object-fit:contain !important; transform:none !important; ' +
+                    'z-index:2147483000 !important; background:#000 !important; }',
                 '#__tvui { position:fixed; left:0; top:0; width:100vw; height:100vh; z-index:2147483500; ' +
                     'pointer-events:none; font-family:sans-serif; color:#fff; display:none; }',
-                'html.__tvon #__tvui { display:block !important; }',
                 '#__tvui .col { position:absolute; bottom:12vh; display:flex; flex-direction:column; align-items:center; }',
                 '#__tvui .it { margin-top:3vh; text-align:center; }',
                 '#__tvui .it svg { width:5.5vh; height:5.5vh; fill:#fff; }',
@@ -99,12 +70,9 @@ class MainActivity : Activity() {
                 '#__tvui .ct { font-size:2.2vh; font-weight:bold; margin-top:0.4vh; text-shadow:0 0 6px #000; }',
                 '#__tvui .meta { position:absolute; bottom:6vh; text-shadow:0 0 6px #000; }',
                 '#__tvui .au { font-size:3vh; font-weight:bold; }',
-                '#__tvui .ds { font-size:2.3vh; margin-top:1vh; }',
-                '#__tvui .bar { position:absolute; left:0; bottom:0; width:100%; height:0.7vh; background:rgba(255,255,255,0.25); }',
-                '#__tvui .fill { height:100%; width:0; background:#fff; }'
+                '#__tvui .ds { font-size:2.3vh; margin-top:1vh; }'
             ].join(' ');
             var st = document.createElement('style');
-            st.id = '__tvfeed';
             st.textContent = css;
             document.documentElement.appendChild(st);
 
@@ -119,15 +87,8 @@ class MainActivity : Activity() {
             var ui = document.createElement('div');
             ui.id = '__tvui';
             ui.innerHTML = '<div class="col">' + item('like', heart) + item('com', bubble) + item('shr', share) +
-                '</div><div class="meta"><div class="au"></div><div class="ds"></div></div>' +
-                '<div class="bar"><div class="fill"></div></div>';
+                '</div><div class="meta"><div class="au"></div><div class="ds"></div></div>';
             document.documentElement.appendChild(ui);
-
-            var bg = document.createElement('video');
-            bg.id = '__tvbg';
-            bg.muted = true;
-            bg.setAttribute('playsinline', '');
-            document.documentElement.appendChild(bg);
 
             var col = ui.querySelector('.col');
             var meta = ui.querySelector('.meta');
@@ -137,10 +98,13 @@ class MainActivity : Activity() {
             var ctShr = ui.querySelector('.it.shr .ct');
             var elAu = ui.querySelector('.au');
             var elDs = ui.querySelector('.ds');
-            var fill = ui.querySelector('.fill');
 
             var active = null;
             var mutedFlag = null;
+
+            function onFeed() {
+                return /\/(foryou|following)/.test(location.pathname);
+            }
 
             function txt(root, sels) {
                 for (var i = 0; i < sels.length; i++) {
@@ -159,51 +123,9 @@ class MainActivity : Activity() {
                 return null;
             }
 
-            function pick() {
-                var vids = document.querySelectorAll('video');
-                for (var i = 0; i < vids.length; i++) {
-                    var v = vids[i];
-                    if (v.id !== '__tvbg' && !v.paused && v.readyState >= 2 && v.videoWidth > 0) { return v; }
-                }
-                if (active && document.documentElement.contains(active)) { return active; }
-                return null;
-            }
-
-            function setupBg(v) {
-                if (!BLUR) { return; }
-                if (v.videoWidth / v.videoHeight >= 1.5) { bg.style.display = 'none'; return; }
-                try {
-                    var s = Math.max(window.innerWidth / 480, window.innerHeight / 270);
-                    bg.style.transform = 'scale(' + s + ')';
-                    bg.srcObject = v.captureStream();
-                    bg.style.display = 'block';
-                    var p = bg.play();
-                    if (p && p.catch) { p.catch(function() {}); }
-                } catch (e) { bg.style.display = 'none'; }
-            }
-
-            function tick() {
-                var p = location.pathname;
-                var on = p.indexOf('/foryou') === 0 || p.indexOf('/following') === 0;
-                document.documentElement.classList.toggle('__tvon', on);
-                if (!on) { bg.style.display = 'none'; return; }
-
-                var v = pick();
-                if (v !== active) {
-                    if (active) { active.classList.remove('__tvactive'); }
-                    active = v;
-                    if (v) {
-                        if (mutedFlag !== null) { v.muted = mutedFlag; }
-                        setupBg(v);
-                    } else {
-                        bg.style.display = 'none';
-                    }
-                }
-                if (!active) { return; }
-                if (!active.classList.contains('__tvactive')) { active.classList.add('__tvactive'); }
-
-                // Position der Bedienelemente am Videorand (wie am Handy)
-                var ratio = active.videoWidth / active.videoHeight;
+            function refresh() {
+                if (!CUSTOM || !active) { return; }
+                var ratio = active.videoWidth > 0 ? active.videoWidth / active.videoHeight : 0.5625;
                 var dw = Math.min(window.innerWidth, window.innerHeight * ratio);
                 var left = (window.innerWidth - dw) / 2;
                 col.style.right = (left + dw * 0.03) + 'px';
@@ -223,11 +145,37 @@ class MainActivity : Activity() {
                     var liked = btn && btn.getAttribute('aria-pressed') === 'true';
                     elLike.classList.toggle('liked', !!liked);
                 }
-                if (active.duration > 0) {
-                    fill.style.width = (100 * active.currentTime / active.duration) + '%';
+            }
+
+            function setActive(v) {
+                if (v === active) { refresh(); return; }
+                if (active) { active.classList.remove('__tvactive'); }
+                active = v;
+                if (CUSTOM) { v.classList.add('__tvactive'); }
+                if (mutedFlag !== null) { v.muted = mutedFlag; }
+                refresh();
+                setTimeout(refresh, 800);
+            }
+
+            function scan() {
+                var vids = document.querySelectorAll('video');
+                for (var i = 0; i < vids.length; i++) {
+                    if (!vids[i].paused && vids[i].readyState >= 2) { setActive(vids[i]); return; }
                 }
             }
-            setInterval(tick, 350);
+
+            document.addEventListener('playing', function(e) {
+                var v = e.target;
+                if (v && v.tagName === 'VIDEO' && onFeed()) { setActive(v); }
+            }, true);
+
+            window.__tvRoute = function() {
+                var on = onFeed();
+                document.documentElement.classList.toggle('__tvon', on);
+                ui.style.display = (on && CUSTOM) ? 'block' : 'none';
+                if (!on && active) { active.classList.remove('__tvactive'); active = null; }
+                if (on) { scan(); }
+            };
 
             window.__tvLike = function() {
                 if (!active) { return; }
@@ -235,6 +183,7 @@ class MainActivity : Activity() {
                 if (!c) { return; }
                 var i = c.querySelector('[data-e2e="like-icon"]');
                 if (i) { (i.closest('button') || i).click(); }
+                setTimeout(refresh, 500);
             };
             window.__tvMute = function() {
                 if (!active) { return; }
@@ -242,6 +191,7 @@ class MainActivity : Activity() {
                 active.muted = mutedFlag;
             };
             window.__tvPause = function() {
+                if (!active) { scan(); }
                 if (!active) { return; }
                 if (active.paused) { active.play(); } else { active.pause(); }
             };
@@ -249,6 +199,8 @@ class MainActivity : Activity() {
                 if (!active) { return; }
                 active.currentTime = Math.max(0, active.currentTime + sec);
             };
+
+            window.__tvRoute();
         })();
     """.trimIndent()
 
@@ -299,7 +251,7 @@ class MainActivity : Activity() {
             var tries = 0;
             window.__cookieTimer = setInterval(function() {
                 tries++;
-                if (tryClick() || tries > 40) {
+                if (tryClick() || tries > 20) {
                     clearInterval(window.__cookieTimer);
                     window.__cookieTimer = null;
                 }
@@ -381,7 +333,7 @@ class MainActivity : Activity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
                 CookieManager.getInstance().flush()
-                injectScripts(view)
+                view.evaluateJavascript(feedJs.replace("__CUSTOM__", customUi.toString()), null)
                 view.evaluateJavascript(cookieJs, null)
                 updateMode(url)
                 handler.postDelayed({ hideSplash() }, 1200)
@@ -389,7 +341,7 @@ class MainActivity : Activity() {
 
             // Wird auch bei Seitenwechseln innerhalb von TikTok aufgerufen
             override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
-                injectScripts(view)
+                view.evaluateJavascript("window.__tvRoute && window.__tvRoute();", null)
                 updateMode(url)
             }
         }
@@ -397,11 +349,6 @@ class MainActivity : Activity() {
         webView.loadUrl(startUrl)
         webView.requestFocus()
         hideSystemBars()
-    }
-
-    private fun injectScripts(view: WebView) {
-        view.evaluateJavascript(styleJs, null)
-        view.evaluateJavascript(feedJs.replace("__BLUR__", blurBackground.toString()), null)
     }
 
     private fun updateMode(url: String?) {
