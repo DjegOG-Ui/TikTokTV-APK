@@ -2,7 +2,15 @@ package com.example.tiktoktv
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -13,6 +21,7 @@ import android.view.KeyEvent
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -38,18 +47,24 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : Activity() {
 
-    // Verhindert, dass die unsichtbare Webseite selbst Videodaten lädt (spart Leistung).
-    // Falls gar keine Videos erscheinen: auf false setzen.
+    // Verhindert, dass die unsichtbare Webseite selbst Videodaten lädt.
     private val blockWebVideo = true
+
+    // Zeitfenster für den Doppelklick auf die Mitte-Taste
+    private val doubleClickMs = 300L
 
     data class Item(
         val id: String,
         val author: String,
         val desc: String,
+        val avatar: String,
         var likes: Long,
         val comments: Long,
         val shares: Long,
@@ -62,12 +77,17 @@ class MainActivity : Activity() {
     private lateinit var playerLayer: FrameLayout
     private lateinit var surface: SurfaceView
     private lateinit var loadingView: TextView
+    private lateinit var sidebar: LinearLayout
+    private lateinit var homeIcon: IconView
+    private lateinit var peopleIcon: IconView
     private lateinit var rightCol: LinearLayout
+    private lateinit var avatar: ImageView
+    private lateinit var heartIcon: IconView
+    private lateinit var pauseIcon: IconView
+    private lateinit var heartPop: IconView
     private lateinit var meta: LinearLayout
-    private lateinit var tvLikeIcon: TextView
     private lateinit var tvLikeCount: TextView
     private lateinit var tvComCount: TextView
-    private lateinit var tvShrCount: TextView
     private lateinit var tvAuthor: TextView
     private lateinit var tvDesc: TextView
     private lateinit var progressFill: View
@@ -78,9 +98,13 @@ class MainActivity : Activity() {
 
     private val items = ArrayList<Item>()
     private val seen = HashSet<String>()
+    private val avatarCache = ConcurrentHashMap<String, Bitmap>()
+    private var currentAvatarUrl = ""
+    private var centerPending: Runnable? = null
 
     @Volatile
     private var nativeActive = false
+    private var onFollowing = false
     private var splashGone = false
     private var hintShownOnce = false
     private var reloadedOnce = false
@@ -95,8 +119,10 @@ class MainActivity : Activity() {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    // Wird vor allen Seitenskripten eingesetzt: liest die Videolisten mit,
-    // die TikTok selbst lädt, und verhindert, dass die Seite Videos abspielt.
+    private val bgColor = Color.rgb(18, 18, 18)
+    private val dimColor = Color.rgb(110, 110, 110)
+
+    // Liest die Videolisten mit, die TikTok selbst lädt
     private val hookJs = """
         (function() {
             if (window.__tvHook) { return; }
@@ -134,10 +160,18 @@ class MainActivity : Activity() {
                         var st = it.stats || {};
                         var au = it.author;
                         var name = '';
-                        if (au) { name = (typeof au === 'string') ? au : (au.uniqueId || au.nickname || ''); }
+                        var av = '';
+                        if (au) {
+                            if (typeof au === 'string') { name = au; }
+                            else {
+                                name = au.uniqueId || au.nickname || '';
+                                av = au.avatarMedium || au.avatarThumb || au.avatarLarger || '';
+                            }
+                        }
                         arr.push({
                             i: String(it.id),
                             a: name,
+                            v: av,
                             d: it.desc || '',
                             l: Number(st.diggCount || 0),
                             c: Number(st.commentCount || 0),
@@ -194,7 +228,6 @@ class MainActivity : Activity() {
             document.addEventListener('DOMContentLoaded', ssr);
             setTimeout(ssr, 2000);
 
-            // Gefällt mir: klickt das Herz genau des Videos mit dieser ID
             window.__tvLike = function(id) {
                 var as = document.querySelectorAll('a[href*="/video/' + id + '"]');
                 for (var i = 0; i < as.length; i++) {
@@ -314,50 +347,76 @@ class MainActivity : Activity() {
 
         // --- Nativer Player mit eigener Oberfläche ---
         playerLayer = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(bgColor)
             visibility = View.GONE
         }
         surface = SurfaceView(this)
         playerLayer.addView(surface, FrameLayout.LayoutParams(screenW, screenH, Gravity.CENTER))
 
-        // Rechte Spalte: Herz, Kommentare, Teilen
+        // Linke Leiste: Logo, Für dich, Folge ich
+        sidebar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(28), 0, dp(28))
+        }
+        sidebar.addView(IconView(this, IconView.LOGO), LinearLayout.LayoutParams(dp(42), dp(42)))
+        sidebar.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+        homeIcon = IconView(this, IconView.HOME)
+        peopleIcon = IconView(this, IconView.PEOPLE)
+        sidebar.addView(homeIcon, LinearLayout.LayoutParams(dp(34), dp(34)).apply { bottomMargin = dp(30) })
+        sidebar.addView(peopleIcon, LinearLayout.LayoutParams(dp(34), dp(34)))
+        sidebar.addView(View(this), LinearLayout.LayoutParams(1, 0, 1.4f))
+        playerLayer.addView(sidebar, FrameLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START))
+
+        // Unten links: Name und Beschreibung
+        meta = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        tvAuthor = label(20f, true)
+        tvDesc = label(16f).apply { maxLines = 3 }
+        meta.addView(tvAuthor)
+        meta.addView(tvDesc, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+        playerLayer.addView(meta, FrameLayout.LayoutParams(
+            dp(300), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
+        ).apply { marginStart = dp(28); bottomMargin = dp(36) })
+
+        // Rechts neben dem Video: Profilbild, Herz, Kommentare, Mehr
         rightCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        fun addAction(symbol: String): Pair<TextView, TextView> {
-            val icon = label(34f).apply { text = symbol; gravity = Gravity.CENTER }
-            val count = label(18f, true).apply { gravity = Gravity.CENTER }
-            rightCol.addView(icon)
-            rightCol.addView(count, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(18) })
-            return Pair(icon, count)
+        avatar = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.rgb(60, 60, 60))
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setOval(0, 0, view.width, view.height)
+                }
+            }
         }
-        val like = addAction("♥")
-        tvLikeIcon = like.first
-        tvLikeCount = like.second
-        tvComCount = addAction("💬").second
-        tvShrCount = addAction("➦").second
-        playerLayer.addView(rightCol, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.END or Gravity.BOTTOM
-        ).apply { marginEnd = dp(24); bottomMargin = dp(40) })
+        rightCol.addView(avatar, LinearLayout.LayoutParams(dp(60), dp(60)).apply { bottomMargin = dp(26) })
 
-        // Unten links: Name und Beschreibung
-        meta = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        tvAuthor = label(22f, true)
-        tvDesc = label(17f).apply { maxLines = 2 }
-        meta.addView(tvAuthor)
-        meta.addView(tvDesc, LinearLayout.LayoutParams(
+        heartIcon = IconView(this, IconView.HEART)
+        rightCol.addView(heartIcon, LinearLayout.LayoutParams(dp(42), dp(42)))
+        tvLikeCount = label(16f, true).apply { gravity = Gravity.CENTER }
+        rightCol.addView(tvLikeCount, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(6) })
-        playerLayer.addView(meta, FrameLayout.LayoutParams(
-            dp(520), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
-        ).apply { marginStart = dp(24); bottomMargin = dp(24) })
+        ).apply { bottomMargin = dp(22) })
+
+        rightCol.addView(IconView(this, IconView.COMMENT), LinearLayout.LayoutParams(dp(42), dp(42)))
+        tvComCount = label(16f, true).apply { gravity = Gravity.CENTER }
+        rightCol.addView(tvComCount, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(22) })
+
+        rightCol.addView(IconView(this, IconView.MORE), LinearLayout.LayoutParams(dp(42), dp(30)))
+        playerLayer.addView(rightCol, FrameLayout.LayoutParams(
+            dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
+        ).apply { marginStart = dp(700); bottomMargin = dp(36) })
 
         // Fortschrittsbalken ganz unten
-        val progressBg = FrameLayout(this).apply { setBackgroundColor(Color.argb(70, 255, 255, 255)) }
+        val progressBg = FrameLayout(this).apply { setBackgroundColor(Color.argb(60, 255, 255, 255)) }
         progressFill = View(this).apply {
             setBackgroundColor(Color.WHITE)
             pivotX = 0f
@@ -369,6 +428,19 @@ class MainActivity : Activity() {
         playerLayer.addView(progressBg, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(4), Gravity.BOTTOM
         ))
+
+        // Pause-Symbol und Herz-Animation in der Mitte
+        pauseIcon = IconView(this, IconView.PLAY).apply {
+            alpha = 0.85f
+            visibility = View.GONE
+        }
+        playerLayer.addView(pauseIcon, FrameLayout.LayoutParams(dp(80), dp(80), Gravity.CENTER))
+
+        heartPop = IconView(this, IconView.HEART).apply {
+            tint = Color.rgb(254, 44, 85)
+            alpha = 0f
+        }
+        playerLayer.addView(heartPop, FrameLayout.LayoutParams(dp(130), dp(130), Gravity.CENTER))
 
         loadingView = label(22f).apply {
             text = "Lädt …"
@@ -392,14 +464,14 @@ class MainActivity : Activity() {
         root.addView(splash)
 
         hint = TextView(this).apply {
-            text = "↑ ↓  Video      OK  Pause      ←  Ton      →  Gefällt mir      Menü  Für dich / Folge ich"
+            text = "↑ ↓  Video     OK  Pause     OK 2×  Gefällt mir     ←  Ton     →  Gefällt mir     Menü  Für dich / Folge ich"
             setTextColor(Color.WHITE)
-            textSize = 18f
+            textSize = 16f
             gravity = Gravity.CENTER
             setPadding(48, 24, 48, 24)
             background = GradientDrawable().apply {
                 cornerRadius = 60f
-                setColor(Color.argb(190, 0, 0, 0))
+                setColor(Color.argb(200, 0, 0, 0))
             }
             alpha = 0f
             layoutParams = FrameLayout.LayoutParams(
@@ -412,6 +484,7 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
+        updateSidebar()
         setupPlayer()
         setupWebView()
 
@@ -446,6 +519,11 @@ class MainActivity : Activity() {
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 refreshUi()
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                pauseIcon.visibility =
+                    if (!playWhenReady && nativeActive && items.isNotEmpty()) View.VISIBLE else View.GONE
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -492,8 +570,7 @@ class MainActivity : Activity() {
 
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
-                // Reserve, falls der Browser das frühe Einsetzen nicht unterstützt
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 view.evaluateJavascript(hookJs, null)
             }
 
@@ -541,7 +618,7 @@ class MainActivity : Activity() {
                 seen.add(id)
                 items.add(
                     Item(
-                        id, o.optString("a"), o.optString("d"),
+                        id, o.optString("a"), o.optString("d"), o.optString("v"),
                         o.optLong("l"), o.optLong("c"), o.optLong("s"), o.optBoolean("g")
                     )
                 )
@@ -569,7 +646,8 @@ class MainActivity : Activity() {
         tvDesc.text = ""
         tvLikeCount.text = ""
         tvComCount.text = ""
-        tvShrCount.text = ""
+        avatar.setImageDrawable(null)
+        currentAvatarUrl = ""
     }
 
     // ---------- Oberfläche ----------
@@ -586,9 +664,45 @@ class MainActivity : Activity() {
         tvDesc.text = it.desc
         tvLikeCount.text = fmt(it.likes)
         tvComCount.text = fmt(it.comments)
-        tvShrCount.text = fmt(it.shares)
-        tvLikeIcon.setTextColor(if (it.liked) Color.rgb(254, 44, 85) else Color.WHITE)
+        heartIcon.tint = if (it.liked) Color.rgb(254, 44, 85) else Color.WHITE
         progressFill.scaleX = 0f
+        loadAvatar(it.avatar)
+    }
+
+    private fun loadAvatar(url: String) {
+        currentAvatarUrl = url
+        if (url.isEmpty()) {
+            avatar.setImageDrawable(null)
+            return
+        }
+        val cached = avatarCache[url]
+        if (cached != null) {
+            avatar.setImageBitmap(cached)
+            return
+        }
+        avatar.setImageDrawable(null)
+        Thread {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.setRequestProperty("User-Agent", desktopUserAgent)
+                c.connectTimeout = 8000
+                c.readTimeout = 8000
+                val bmp = BitmapFactory.decodeStream(c.inputStream)
+                if (bmp != null) {
+                    avatarCache[url] = bmp
+                    runOnUiThread {
+                        if (currentAvatarUrl == url) avatar.setImageBitmap(bmp)
+                    }
+                }
+            } catch (e: Exception) {
+                // Profilbild bleibt einfach leer
+            }
+        }.start()
+    }
+
+    private fun updateSidebar() {
+        homeIcon.tint = if (onFollowing) dimColor else Color.WHITE
+        peopleIcon.tint = if (onFollowing) Color.WHITE else dimColor
     }
 
     private fun fitVideo(vs: VideoSize) {
@@ -606,15 +720,26 @@ class MainActivity : Activity() {
         surface.layoutParams = FrameLayout.LayoutParams(vw, vh, Gravity.CENTER)
 
         val side = (screenW - vw) / 2
-        (rightCol.layoutParams as FrameLayout.LayoutParams).apply {
-            marginEnd = side + dp(24)
+        val roomy = side >= dp(260)
+        sidebar.visibility = if (side >= dp(90)) View.VISIBLE else View.GONE
+
+        // Bedienelemente rechts neben dem Video (bei Querformat im Bild)
+        rightCol.layoutParams = FrameLayout.LayoutParams(
+            dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
+        ).apply {
+            marginStart = if (roomy) side + vw + dp(16) else maxOf(0, side + vw - dp(100))
+            bottomMargin = dp(36)
         }
-        (meta.layoutParams as FrameLayout.LayoutParams).apply {
-            marginStart = side + dp(24)
-            width = minOf(dp(520), (vw * 0.7f).toInt())
+
+        // Name und Beschreibung links neben dem Video (bei Querformat im Bild)
+        meta.layoutParams = FrameLayout.LayoutParams(
+            if (roomy) side - dp(28) - dp(24) else maxOf(dp(200), vw - dp(140)),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.START or Gravity.BOTTOM
+        ).apply {
+            marginStart = if (roomy) dp(28) else side + dp(24)
+            bottomMargin = dp(36)
         }
-        rightCol.requestLayout()
-        meta.requestLayout()
     }
 
     private val progressTicker = object : Runnable {
@@ -631,6 +756,14 @@ class MainActivity : Activity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
+    private fun showHeartPop() {
+        heartPop.animate().cancel()
+        heartPop.scaleX = 0.6f
+        heartPop.scaleY = 0.6f
+        heartPop.alpha = 1f
+        heartPop.animate().scaleX(1.15f).scaleY(1.15f).alpha(0f).setDuration(700).start()
+    }
+
     // ---------- Modus ----------
 
     private fun updateMode(url: String?) {
@@ -641,7 +774,9 @@ class MainActivity : Activity() {
             webView.loadUrl(feedUrl)
             return
         }
-        val isFeed = url.contains("tiktok.com/foryou") || url.contains("tiktok.com/following")
+        onFollowing = url.contains("tiktok.com/following")
+        updateSidebar()
+        val isFeed = url.contains("tiktok.com/foryou") || onFollowing
         setNative(isFeed)
     }
 
@@ -657,7 +792,6 @@ class MainActivity : Activity() {
                 hintShownOnce = true
                 showHint()
             }
-            // Falls nach 15 Sekunden nichts angekommen ist: einmal neu laden
             handler.postDelayed({
                 if (nativeActive && items.isEmpty()) {
                     if (!reloadedOnce) {
@@ -692,7 +826,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(hideHint)
         hint.animate().cancel()
         hint.alpha = 1f
-        handler.postDelayed(hideHint, 6000)
+        handler.postDelayed(hideHint, 7000)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -735,13 +869,19 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun likeCurrent() {
+    // onlyLike = true (Doppelklick): liked nur, nimmt ein bestehendes Like nicht zurück
+    private fun likeCurrent(onlyLike: Boolean) {
         val idx = player.currentMediaItemIndex
         val item = items.getOrNull(idx) ?: return
+        if (onlyLike && item.liked) {
+            showHeartPop()
+            return
+        }
         webView.evaluateJavascript("window.__tvLike && window.__tvLike('" + item.id + "');") { r ->
             if (r == "true") {
                 item.liked = !item.liked
                 item.likes += if (item.liked) 1 else -1
+                if (item.liked) showHeartPop()
                 if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
             } else {
                 toast("Gefällt mir gerade nicht möglich")
@@ -763,6 +903,23 @@ class MainActivity : Activity() {
         player.seekTo(maxOf(0L, player.currentPosition + ms))
     }
 
+    private fun onCenterPressed() {
+        val pending = centerPending
+        if (pending != null) {
+            // Zweiter Druck innerhalb des Zeitfensters: Gefällt mir statt Pause
+            handler.removeCallbacks(pending)
+            centerPending = null
+            likeCurrent(true)
+        } else {
+            val r = Runnable {
+                centerPending = null
+                player.playWhenReady = !player.playWhenReady
+            }
+            centerPending = r
+            handler.postDelayed(r, doubleClickMs)
+        }
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val code = event.keyCode
         val down = event.action == KeyEvent.ACTION_DOWN
@@ -771,8 +928,7 @@ class MainActivity : Activity() {
             when (code) {
                 KeyEvent.KEYCODE_MENU -> {
                     if (down) {
-                        val u = webView.url ?: ""
-                        val toFollowing = !u.contains("/following")
+                        val toFollowing = !onFollowing
                         resetFeed()
                         webView.loadUrl(if (toFollowing) followingUrl else feedUrl)
                         toast(if (toFollowing) "Folge ich" else "Für dich")
@@ -781,13 +937,16 @@ class MainActivity : Activity() {
                 }
                 KeyEvent.KEYCODE_DPAD_DOWN -> { if (down) nextVideo(); return true }
                 KeyEvent.KEYCODE_DPAD_UP -> { if (down) previousVideo(); return true }
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                    if (down && event.repeatCount == 0) onCenterPressed()
+                    return true
+                }
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY,
                 KeyEvent.KEYCODE_MEDIA_PAUSE -> {
                     if (down) player.playWhenReady = !player.playWhenReady
                     return true
                 }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) likeCurrent(); return true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) likeCurrent(false); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT -> { if (down) toggleMute(); return true }
                 KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) seekBy(-10000); return true }
                 KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) seekBy(10000); return true }
@@ -823,5 +982,109 @@ class MainActivity : Activity() {
         player.release()
         webView.destroy()
         super.onDestroy()
+    }
+}
+
+// Einfache, selbst gezeichnete Symbole (kein Emoji, daher auf jedem Gerät gleich)
+class IconView(context: Context, private val kind: Int) : View(context) {
+
+    companion object {
+        const val HEART = 0
+        const val COMMENT = 1
+        const val MORE = 2
+        const val HOME = 3
+        const val PEOPLE = 4
+        const val LOGO = 5
+        const val PLAY = 6
+    }
+
+    var tint: Int = Color.WHITE
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+    private val rect = RectF()
+
+    private fun note(canvas: Canvas, w: Float, h: Float, dx: Float, color: Int) {
+        paint.color = color
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 0.12f * w
+        paint.strokeCap = Paint.Cap.ROUND
+        canvas.drawLine(0.58f * w + dx, 0.14f * h, 0.58f * w + dx, 0.68f * h, paint)
+        path.reset()
+        path.moveTo(0.58f * w + dx, 0.14f * h)
+        path.quadTo(0.66f * w + dx, 0.34f * h, 0.88f * w + dx, 0.34f * h)
+        canvas.drawPath(path, paint)
+        paint.style = Paint.Style.FILL
+        canvas.drawCircle(0.4f * w + dx, 0.72f * h, 0.17f * w, paint)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        paint.style = Paint.Style.FILL
+        paint.color = tint
+        paint.strokeWidth = 0f
+
+        when (kind) {
+            HEART -> {
+                path.reset()
+                path.moveTo(0.5f * w, 0.88f * h)
+                path.cubicTo(0.05f * w, 0.55f * h, 0.08f * w, 0.15f * h, 0.3f * w, 0.15f * h)
+                path.cubicTo(0.42f * w, 0.15f * h, 0.5f * w, 0.25f * h, 0.5f * w, 0.32f * h)
+                path.cubicTo(0.5f * w, 0.25f * h, 0.58f * w, 0.15f * h, 0.7f * w, 0.15f * h)
+                path.cubicTo(0.92f * w, 0.15f * h, 0.95f * w, 0.55f * h, 0.5f * w, 0.88f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+            COMMENT -> {
+                rect.set(0.08f * w, 0.12f * h, 0.92f * w, 0.72f * h)
+                canvas.drawRoundRect(rect, 0.16f * w, 0.16f * w, paint)
+                path.reset()
+                path.moveTo(0.26f * w, 0.66f * h)
+                path.lineTo(0.26f * w, 0.9f * h)
+                path.lineTo(0.5f * w, 0.68f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+            MORE -> {
+                canvas.drawCircle(0.2f * w, 0.5f * h, 0.09f * w, paint)
+                canvas.drawCircle(0.5f * w, 0.5f * h, 0.09f * w, paint)
+                canvas.drawCircle(0.8f * w, 0.5f * h, 0.09f * w, paint)
+            }
+            HOME -> {
+                path.reset()
+                path.moveTo(0.5f * w, 0.1f * h)
+                path.lineTo(0.94f * w, 0.5f * h)
+                path.lineTo(0.06f * w, 0.5f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+                canvas.drawRect(0.18f * w, 0.48f * h, 0.82f * w, 0.9f * h, paint)
+            }
+            PEOPLE -> {
+                canvas.drawCircle(0.36f * w, 0.32f * h, 0.15f * w, paint)
+                rect.set(0.1f * w, 0.55f * h, 0.62f * w, 0.9f * h)
+                canvas.drawRoundRect(rect, 0.2f * w, 0.2f * w, paint)
+                canvas.drawCircle(0.7f * w, 0.38f * h, 0.12f * w, paint)
+                rect.set(0.54f * w, 0.6f * h, 0.92f * w, 0.9f * h)
+                canvas.drawRoundRect(rect, 0.16f * w, 0.16f * w, paint)
+            }
+            LOGO -> {
+                note(canvas, w, h, -0.03f * w, Color.rgb(37, 244, 238))
+                note(canvas, w, h, 0.03f * w, Color.rgb(254, 44, 85))
+                note(canvas, w, h, 0f, Color.WHITE)
+            }
+            PLAY -> {
+                path.reset()
+                path.moveTo(0.25f * w, 0.15f * h)
+                path.lineTo(0.9f * w, 0.5f * h)
+                path.lineTo(0.25f * w, 0.85f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+        }
     }
 }
