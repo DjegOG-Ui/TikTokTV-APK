@@ -30,6 +30,74 @@ class MainActivity : Activity() {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+    // Klickt das Cookie-Banner automatisch weg und lehnt dabei
+    // alle optionalen Cookies ab (nur notwendige bleiben aktiv).
+    private val cookieJs = """
+        (function() {
+            if (window.__cookieTimer) { clearInterval(window.__cookieTimer); }
+
+            var declineWords = ['ablehnen', 'decline', 'reject', 'refuse', 'necessary',
+                                'notwendig', 'erforderlich', 'essential', 'essenziell'];
+            var acceptWords = ['alle zulassen', 'allow all', 'accept all', 'alle akzeptieren',
+                               'zustimmen', 'akzeptieren', 'accept', 'agree'];
+
+            function collectButtons(root, out) {
+                var els = root.querySelectorAll('*');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                        out.push(el);
+                    }
+                    if (el.shadowRoot) { collectButtons(el.shadowRoot, out); }
+                }
+            }
+
+            function matches(text, words) {
+                for (var i = 0; i < words.length; i++) {
+                    if (text.indexOf(words[i]) !== -1) { return true; }
+                }
+                return false;
+            }
+
+            function tryClick() {
+                var banner = document.querySelector('tiktok-cookie-banner');
+                if (!banner) { return false; }
+                var buttons = [];
+                collectButtons(banner.shadowRoot ? banner.shadowRoot : banner, buttons);
+                if (buttons.length === 0) { return false; }
+
+                var target = null;
+                for (var i = 0; i < buttons.length; i++) {
+                    var t = (buttons[i].innerText || buttons[i].textContent || '').toLowerCase();
+                    if (matches(t, declineWords) && !matches(t, acceptWords)) {
+                        target = buttons[i];
+                        break;
+                    }
+                }
+                if (target === null) {
+                    // Fallback: Button, der nicht nach "Alle zulassen" aussieht
+                    var others = [];
+                    for (var j = 0; j < buttons.length; j++) {
+                        var t2 = (buttons[j].innerText || buttons[j].textContent || '').toLowerCase();
+                        if (t2.length > 0 && !matches(t2, acceptWords)) { others.push(buttons[j]); }
+                    }
+                    if (others.length === 1) { target = others[0]; }
+                }
+                if (target !== null) { target.click(); return true; }
+                return false;
+            }
+
+            var tries = 0;
+            window.__cookieTimer = setInterval(function() {
+                tries++;
+                if (tryClick() || tries > 40) {
+                    clearInterval(window.__cookieTimer);
+                    window.__cookieTimer = null;
+                }
+            }, 1000);
+        })();
+    """.trimIndent()
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,6 +133,7 @@ class MainActivity : Activity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
                 CookieManager.getInstance().flush()
+                view.evaluateJavascript(cookieJs, null)
                 if (url != null && url.contains("tiktok.com/foryou") && !feedMode) {
                     setFeedMode(true)
                 }
