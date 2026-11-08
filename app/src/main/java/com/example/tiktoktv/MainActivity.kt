@@ -36,6 +36,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.media3.common.MediaItem
@@ -71,8 +72,10 @@ class MainActivity : Activity() {
         val avatar: String,
         var likes: Long,
         val comments: Long,
+        var collects: Long,
         val shares: Long,
-        var liked: Boolean
+        var liked: Boolean,
+        var saved: Boolean
     )
 
     private lateinit var webView: WebView
@@ -86,15 +89,21 @@ class MainActivity : Activity() {
     private lateinit var rightCol: LinearLayout
     private lateinit var avatar: ImageView
     private lateinit var heartIcon: IconView
+    private lateinit var saveIcon: IconView
     private lateinit var pauseIcon: IconView
     private lateinit var heartPop: IconView
     private lateinit var meta: LinearLayout
     private lateinit var tvLikeCount: TextView
     private lateinit var tvComCount: TextView
+    private lateinit var tvSaveCount: TextView
     private lateinit var tvShrCount: TextView
     private lateinit var tvAuthor: TextView
     private lateinit var tvDesc: TextView
     private lateinit var progressFill: View
+    private lateinit var commentPanel: LinearLayout
+    private lateinit var commentScroll: ScrollView
+    private lateinit var commentList: LinearLayout
+    private lateinit var commentTitle: TextView
     private lateinit var player: ExoPlayer
     private lateinit var fontRegular: Typeface
     private lateinit var fontBold: Typeface
@@ -104,10 +113,13 @@ class MainActivity : Activity() {
     private val topCells = ArrayList<LinearLayout>()
     private val sideRows = ArrayList<LinearLayout>()
     private val sideLabels = ArrayList<TextView>()
+    private val actionCells = ArrayList<LinearLayout>()
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideHint = Runnable { hint.animate().alpha(0f).setDuration(400).start() }
     private val menuTimeout = Runnable { closeMenu() }
+    private val actionTimeout = Runnable { exitActionMode() }
+    private val commentTimeout = Runnable { checkComments() }
 
     private val items = ArrayList<Item>()
     private val seen = HashSet<String>()
@@ -123,6 +135,12 @@ class MainActivity : Activity() {
     private var menuZone = 0
     private var topIdx = 0
     private var sideIdx = 0
+    private var actionMode = false
+    private var actionIdx = 0
+    private var commentsOpen = false
+    private var commentGot = false
+    private var commentRetried = false
+    private var pagePanelOpen = false
     private var roomForSidebar = true
     private var splashGone = false
     private var hintShownOnce = false
@@ -139,8 +157,10 @@ class MainActivity : Activity() {
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     private val bgColor = Color.rgb(18, 18, 18)
+    private val savedColor = Color.rgb(250, 206, 21)
+    private val likedColor = Color.rgb(254, 44, 85)
 
-    // Liest die Videolisten mit, die TikTok selbst lädt
+    // Liest Videolisten und Kommentare mit, die TikTok selbst lädt
     private val hookJs = """
         (function() {
             if (window.__tvHook) { return; }
@@ -193,8 +213,10 @@ class MainActivity : Activity() {
                             d: it.desc || '',
                             l: Number(st.diggCount || 0),
                             c: Number(st.commentCount || 0),
+                            k: Number(st.collectCount || 0),
                             s: Number(st.shareCount || 0),
                             g: !!it.digged,
+                            b: !!it.collected,
                             u: urlOf(it.video)
                         });
                     }
@@ -204,8 +226,32 @@ class MainActivity : Activity() {
                 } catch (e) {}
             }
 
+            function sendComments(json) {
+                try {
+                    var cs = json.comments || [];
+                    var arr = [];
+                    for (var i = 0; i < cs.length; i++) {
+                        var c = cs[i];
+                        var u = c.user || {};
+                        arr.push({
+                            t: c.text || '',
+                            n: u.nickname || u.unique_id || u.uniqueId || '',
+                            l: Number(c.digg_count || c.diggCount || 0),
+                            r: Number(c.reply_comment_total || c.replyCommentTotal || 0)
+                        });
+                    }
+                    if (window.AndroidBridge) { window.AndroidBridge.onComments(JSON.stringify(arr)); }
+                } catch (e) {}
+            }
+
             function wanted(u) {
-                return u.indexOf('item_list') > -1 || u.indexOf('/search/') > -1;
+                return u.indexOf('item_list') > -1 || u.indexOf('/search/') > -1 || u.indexOf('/comment/list') > -1;
+            }
+
+            function handle(u, json) {
+                if (u.indexOf('/comment/list/reply') > -1) { return; }
+                if (u.indexOf('/comment/list') > -1) { sendComments(json); }
+                else { send(json); }
             }
 
             var of = window.fetch;
@@ -217,7 +263,7 @@ class MainActivity : Activity() {
                         var u = (typeof a[0] === 'string') ? a[0] : ((a[0] && a[0].url) || '');
                         if (wanted(u)) {
                             p.then(function(r) {
-                                r.clone().json().then(send).catch(function() {});
+                                r.clone().json().then(function(j) { handle(u, j); }).catch(function() {});
                             }).catch(function() {});
                         }
                     } catch (e) {}
@@ -235,7 +281,8 @@ class MainActivity : Activity() {
                 var x = this;
                 x.addEventListener('load', function() {
                     try {
-                        if (wanted(x.__u || '')) { send(JSON.parse(x.responseText)); }
+                        var u = x.__u || '';
+                        if (wanted(u)) { handle(u, JSON.parse(x.responseText)); }
                     } catch (e) {}
                 });
                 return os.apply(this, arguments);
@@ -250,12 +297,19 @@ class MainActivity : Activity() {
             document.addEventListener('DOMContentLoaded', ssr);
             setTimeout(ssr, 2000);
 
-            // Gefällt mir: erst über die Video-ID, sonst das Herz, das gerade mittig im Bild steht
-            window.__tvLike = function(id) {
-                var SEL = '[data-e2e="like-icon"], [data-e2e="browse-like-icon"], button[aria-label*="like" i], button[aria-label*="gefällt" i]';
+            // Klickt Herz, Kommentare oder Speichern des aktuellen Videos auf der unsichtbaren Seite.
+            // Erst über die Video-ID, sonst das Symbol, das gerade mittig im Bild steht.
+            var SELS = {
+                like: '[data-e2e="like-icon"], [data-e2e="browse-like-icon"], button[aria-label*="like" i], button[aria-label*="gefällt" i]',
+                comment: '[data-e2e="comment-icon"], [data-e2e="browse-comment-icon"], button[aria-label*="comment" i], button[aria-label*="kommentar" i]',
+                save: '[data-e2e="bookmark-icon"], [data-e2e="collect-icon"], [data-e2e="undefined-icon"], [data-e2e="browse-bookmark-icon"], button[aria-label*="favorit" i], button[aria-label*="bookmark" i]'
+            };
+            window.__tvClick = function(kind, id) {
+                var SEL = SELS[kind];
+                if (!SEL) { return 'nokind'; }
                 function clickIcon(ic) { (ic.closest('button') || ic).click(); }
                 var icons = document.querySelectorAll(SEL);
-                if (!icons.length) { return 'noicons:' + document.querySelectorAll('[data-e2e]').length; }
+                if (!icons.length) { return 'noicons-' + kind + ':' + document.querySelectorAll('[data-e2e]').length; }
 
                 var as = document.querySelectorAll('a[href*="/video/' + id + '"]');
                 for (var i = 0; i < as.length; i++) {
@@ -352,6 +406,11 @@ class MainActivity : Activity() {
         fun onItems(json: String) {
             runOnUiThread { addItems(json) }
         }
+
+        @JavascriptInterface
+        fun onComments(json: String) {
+            runOnUiThread { showComments(json) }
+        }
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -372,6 +431,23 @@ class MainActivity : Activity() {
     private fun pill(): GradientDrawable = GradientDrawable().apply {
         cornerRadius = dp(14).toFloat()
         setColor(Color.argb(80, 255, 255, 255))
+    }
+
+    // Ein Symbol mit Zahl in der rechten Spalte
+    private fun makeAction(icon: IconView, count: TextView): LinearLayout {
+        val cell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        cell.addView(icon, LinearLayout.LayoutParams(dp(38), dp(38)))
+        cell.addView(count, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        rightCol.addView(cell, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(6) })
+        return cell
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -421,7 +497,7 @@ class MainActivity : Activity() {
             val cell = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(dp(22), dp(8), dp(22), dp(8))
+                setPadding(dp(16), dp(8), dp(16), dp(8))
             }
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -435,7 +511,12 @@ class MainActivity : Activity() {
             }
             val t = label(19f, true)
             t.text = names[i]
-            row.addView(t)
+            t.setSingleLine(true)
+            t.setHorizontallyScrolling(true)
+            t.gravity = Gravity.CENTER
+            // Feste Breite, damit der Text nie abgeschnitten wird
+            val tw = (t.paint.measureText(names[i]) * 1.25f).toInt() + dp(8)
+            row.addView(t, LinearLayout.LayoutParams(tw, ViewGroup.LayoutParams.WRAP_CONTENT))
             val line = View(this)
             line.setBackgroundColor(Color.WHITE)
             cell.addView(row)
@@ -443,8 +524,8 @@ class MainActivity : Activity() {
             topBar.addView(cell, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply {
-                marginStart = dp(6)
-                marginEnd = dp(6)
+                marginStart = dp(4)
+                marginEnd = dp(4)
             })
             topTexts.add(t)
             topLines.add(line)
@@ -509,7 +590,7 @@ class MainActivity : Activity() {
             dp(300), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
         ).apply { marginStart = dp(100); bottomMargin = dp(36) })
 
-        // Rechts neben dem Video: Profilbild, Herz, Kommentare, Teilen
+        // Rechts neben dem Video: Profilbild, Herz, Kommentare, Speichern, Teilen
         rightCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -535,34 +616,30 @@ class MainActivity : Activity() {
         ring.addView(avatar, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         ))
-        avatarBox.addView(ring, FrameLayout.LayoutParams(dp(60), dp(60)))
+        avatarBox.addView(ring, FrameLayout.LayoutParams(dp(56), dp(56)))
         avatarBox.addView(
             IconView(this, IconView.PLUS_BADGE),
-            FrameLayout.LayoutParams(dp(24), dp(24), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            FrameLayout.LayoutParams(dp(22), dp(22), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
         )
-        rightCol.addView(avatarBox, LinearLayout.LayoutParams(dp(60), dp(72)).apply { bottomMargin = dp(16) })
+        rightCol.addView(avatarBox, LinearLayout.LayoutParams(dp(56), dp(68)).apply { bottomMargin = dp(10) })
 
         heartIcon = IconView(this, IconView.HEART)
-        rightCol.addView(heartIcon, LinearLayout.LayoutParams(dp(44), dp(44)))
         tvLikeCount = label(15f, true).apply { gravity = Gravity.CENTER }
-        rightCol.addView(tvLikeCount, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(18) })
+        actionCells.add(makeAction(heartIcon, tvLikeCount))
 
-        rightCol.addView(IconView(this, IconView.COMMENT), LinearLayout.LayoutParams(dp(44), dp(44)))
         tvComCount = label(15f, true).apply { gravity = Gravity.CENTER }
-        rightCol.addView(tvComCount, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(18) })
+        actionCells.add(makeAction(IconView(this, IconView.COMMENT), tvComCount))
 
-        rightCol.addView(IconView(this, IconView.SHARE), LinearLayout.LayoutParams(dp(44), dp(44)))
+        saveIcon = IconView(this, IconView.BOOKMARK)
+        tvSaveCount = label(15f, true).apply { gravity = Gravity.CENTER }
+        actionCells.add(makeAction(saveIcon, tvSaveCount))
+
         tvShrCount = label(15f, true).apply { gravity = Gravity.CENTER }
-        rightCol.addView(tvShrCount, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
+        makeAction(IconView(this, IconView.SHARE), tvShrCount)
+
         playerLayer.addView(rightCol, FrameLayout.LayoutParams(
             dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
-        ).apply { marginStart = dp(700); bottomMargin = dp(30) })
+        ).apply { marginStart = dp(700); bottomMargin = dp(24) })
 
         // Fortschrittsbalken ganz unten
         val progressBg = FrameLayout(this).apply { setBackgroundColor(Color.argb(60, 255, 255, 255)) }
@@ -586,10 +663,32 @@ class MainActivity : Activity() {
         playerLayer.addView(pauseIcon, FrameLayout.LayoutParams(dp(80), dp(80), Gravity.CENTER))
 
         heartPop = IconView(this, IconView.HEART).apply {
-            tint = Color.rgb(254, 44, 85)
+            tint = likedColor
             alpha = 0f
         }
         playerLayer.addView(heartPop, FrameLayout.LayoutParams(dp(130), dp(130), Gravity.CENTER))
+
+        // Kommentar-Fenster (rechts)
+        commentPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.argb(238, 18, 18, 18))
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            visibility = View.GONE
+        }
+        commentTitle = label(18f, true)
+        commentTitle.text = "Kommentare"
+        commentPanel.addView(commentTitle)
+        commentScroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        commentList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        commentScroll.addView(commentList, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        commentPanel.addView(commentScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        ).apply { topMargin = dp(12) })
+        playerLayer.addView(commentPanel, FrameLayout.LayoutParams(
+            dp(440), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END
+        ))
 
         loadingView = label(22f).apply {
             text = "Lädt …"
@@ -613,7 +712,7 @@ class MainActivity : Activity() {
         root.addView(splash)
 
         hint = TextView(this).apply {
-            text = "↑ ↓ Video     OK Pause     OK 2× Gefällt mir     ← Ton     → Gefällt mir     Menü  Navigation"
+            text = "↑ ↓ Video     OK Pause     OK 2× Gefällt mir     → Herz / Kommentare / Speichern     ← Ton     Menü  Navigation"
             setTextColor(Color.WHITE)
             textSize = 16f
             typeface = fontRegular
@@ -635,6 +734,7 @@ class MainActivity : Activity() {
         setContentView(root)
 
         renderMenu()
+        renderActions()
         setupPlayer()
         setupWebView()
 
@@ -769,7 +869,8 @@ class MainActivity : Activity() {
                 items.add(
                     Item(
                         id, o.optString("a"), o.optString("d"), o.optString("v"),
-                        o.optLong("l"), o.optLong("c"), o.optLong("s"), o.optBoolean("g")
+                        o.optLong("l"), o.optLong("c"), o.optLong("k"), o.optLong("s"),
+                        o.optBoolean("g"), o.optBoolean("b")
                     )
                 )
                 player.addMediaItem(MediaItem.fromUri(url))
@@ -786,6 +887,9 @@ class MainActivity : Activity() {
     }
 
     private fun resetFeed() {
+        hideCommentsPanel()
+        pagePanelOpen = false
+        exitActionMode()
         items.clear()
         seen.clear()
         player.stop()
@@ -796,6 +900,7 @@ class MainActivity : Activity() {
         tvDesc.text = ""
         tvLikeCount.text = ""
         tvComCount.text = ""
+        tvSaveCount.text = ""
         tvShrCount.text = ""
         avatar.setImageDrawable(null)
         currentAvatarUrl = ""
@@ -815,8 +920,10 @@ class MainActivity : Activity() {
         tvDesc.text = it.desc
         tvLikeCount.text = fmt(it.likes)
         tvComCount.text = fmt(it.comments)
+        tvSaveCount.text = fmt(it.collects)
         tvShrCount.text = fmt(it.shares)
-        heartIcon.tint = if (it.liked) Color.rgb(254, 44, 85) else Color.WHITE
+        heartIcon.tint = if (it.liked) likedColor else Color.WHITE
+        saveIcon.tint = if (it.saved) savedColor else Color.WHITE
         progressFill.scaleX = 0f
         loadAvatar(it.avatar)
     }
@@ -876,7 +983,7 @@ class MainActivity : Activity() {
             dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
         ).apply {
             marginStart = if (roomy) side + vw + dp(16) else maxOf(0, side + vw - dp(100))
-            bottomMargin = dp(30)
+            bottomMargin = dp(24)
         }
 
         // Name und Beschreibung links neben dem Video (bei Querformat im Bild)
@@ -914,6 +1021,155 @@ class MainActivity : Activity() {
         heartPop.scaleY = 0.6f
         heartPop.alpha = 1f
         heartPop.animate().scaleX(1.15f).scaleY(1.15f).alpha(0f).setDuration(700).start()
+    }
+
+    // ---------- Symbole rechts auswählen ----------
+
+    private fun renderActions() {
+        for (i in actionCells.indices) {
+            actionCells[i].background = if (actionMode && i == actionIdx) pill() else null
+        }
+    }
+
+    private fun enterActionMode() {
+        actionMode = true
+        actionIdx = 0
+        scheduleActionExit()
+        renderActions()
+    }
+
+    private fun exitActionMode() {
+        actionMode = false
+        handler.removeCallbacks(actionTimeout)
+        renderActions()
+    }
+
+    private fun scheduleActionExit() {
+        handler.removeCallbacks(actionTimeout)
+        handler.postDelayed(actionTimeout, 6000)
+    }
+
+    private fun handleActionKey(code: Int) {
+        scheduleActionExit()
+        when (code) {
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                if (actionIdx > 0) actionIdx--
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (actionIdx < actionCells.size - 1) actionIdx++
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_BACK -> {
+                exitActionMode()
+                return
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                when (actionIdx) {
+                    0 -> likeCurrent(false)
+                    1 -> {
+                        exitActionMode()
+                        openComments()
+                        return
+                    }
+                    2 -> saveCurrent()
+                }
+            }
+        }
+        renderActions()
+    }
+
+    // ---------- Kommentare ----------
+
+    private fun addCommentMessage(msg: String) {
+        commentList.removeAllViews()
+        val tv = label(16f)
+        tv.text = msg
+        tv.setTextColor(Color.argb(190, 255, 255, 255))
+        commentList.addView(tv)
+    }
+
+    private fun openComments() {
+        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
+        commentsOpen = true
+        commentGot = false
+        commentRetried = false
+        commentTitle.text = "Kommentare (" + fmt(item.comments) + ")"
+        addCommentMessage("Lädt Kommentare …")
+        commentPanel.visibility = View.VISIBLE
+        commentScroll.scrollTo(0, 0)
+        pagePanelOpen = true
+        clickPage("comment") { r ->
+            if (r == null || !r.contains("ok")) {
+                handler.removeCallbacks(commentTimeout)
+                addCommentMessage("Kommentare nicht verfügbar " + (r ?: ""))
+            }
+        }
+        handler.removeCallbacks(commentTimeout)
+        handler.postDelayed(commentTimeout, 7000)
+    }
+
+    private fun checkComments() {
+        if (!commentsOpen || commentGot) return
+        if (!commentRetried) {
+            commentRetried = true
+            clickPage("comment")
+            handler.postDelayed(commentTimeout, 6000)
+        } else {
+            addCommentMessage("Keine Kommentare geladen")
+        }
+    }
+
+    private fun showComments(json: String) {
+        if (!commentsOpen) return
+        commentGot = true
+        handler.removeCallbacks(commentTimeout)
+        try {
+            val arr = JSONArray(json)
+            if (arr.length() == 0) {
+                addCommentMessage("Noch keine Kommentare")
+                return
+            }
+            commentList.removeAllViews()
+            for (n in 0 until arr.length()) {
+                val o = arr.getJSONObject(n)
+                val box = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, dp(10), 0, dp(10))
+                }
+                val name = label(14f, true)
+                name.text = o.optString("n")
+                name.setTextColor(Color.argb(190, 255, 255, 255))
+                val text = label(16f)
+                text.text = o.optString("t")
+                val likes = label(13f)
+                val replies = o.optLong("r")
+                likes.text = "♥ " + fmt(o.optLong("l")) + (if (replies > 0) "     " + replies + " Antworten" else "")
+                likes.setTextColor(Color.argb(150, 255, 255, 255))
+                box.addView(name)
+                box.addView(text)
+                box.addView(likes)
+                commentList.addView(box, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+            }
+            commentScroll.scrollTo(0, 0)
+        } catch (e: Exception) {
+            addCommentMessage("Kommentarfehler")
+        }
+    }
+
+    private fun hideCommentsPanel() {
+        commentsOpen = false
+        handler.removeCallbacks(commentTimeout)
+        commentPanel.visibility = View.GONE
+    }
+
+    private fun closeComments() {
+        if (!commentsOpen) return
+        hideCommentsPanel()
+        if (pagePanelOpen) {
+            pagePanelOpen = false
+            clickPage("comment")
+        }
     }
 
     // ---------- Menü (Menü-Taste) ----------
@@ -1127,6 +1383,8 @@ class MainActivity : Activity() {
             playerLayer.visibility = View.GONE
             player.playWhenReady = false
             menuOpen = false
+            hideCommentsPanel()
+            exitActionMode()
         }
     }
 
@@ -1146,7 +1404,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(hideHint)
         hint.animate().cancel()
         hint.alpha = 1f
-        handler.postDelayed(hideHint, 7000)
+        handler.postDelayed(hideHint, 8000)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1171,6 +1429,14 @@ class MainActivity : Activity() {
         webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
     }
 
+    // Klickt ein Symbol (like / comment / save) des aktuellen Videos auf der unsichtbaren Seite
+    private fun clickPage(kind: String, cb: ((String?) -> Unit)? = null) {
+        val id = items.getOrNull(player.currentMediaItemIndex)?.id ?: ""
+        webView.evaluateJavascript(
+            "window.__tvClick ? window.__tvClick('" + kind + "','" + id + "') : 'nofn';"
+        ) { r -> cb?.invoke(r) }
+    }
+
     private fun nextVideo() {
         if (player.hasNextMediaItem()) {
             player.seekToNextMediaItem()
@@ -1191,15 +1457,12 @@ class MainActivity : Activity() {
 
     // onlyLike = true (Doppelklick): liked nur, nimmt ein bestehendes Like nicht zurück
     private fun likeCurrent(onlyLike: Boolean) {
-        val idx = player.currentMediaItemIndex
-        val item = items.getOrNull(idx) ?: return
+        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
         if (onlyLike && item.liked) {
             showHeartPop()
             return
         }
-        webView.evaluateJavascript(
-            "window.__tvLike ? window.__tvLike('" + item.id + "') : 'nofn';"
-        ) { r ->
+        clickPage("like") { r ->
             if (r != null && r.contains("ok")) {
                 item.liked = !item.liked
                 item.likes += if (item.liked) 1 else -1
@@ -1207,6 +1470,20 @@ class MainActivity : Activity() {
                 if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
             } else {
                 toast("Gefällt mir nicht möglich " + (r ?: ""))
+            }
+        }
+    }
+
+    private fun saveCurrent() {
+        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
+        clickPage("save") { r ->
+            if (r != null && r.contains("ok")) {
+                item.saved = !item.saved
+                item.collects += if (item.saved) 1 else -1
+                toast(if (item.saved) "Gespeichert" else "Aus Gespeicherten entfernt")
+                if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
+            } else {
+                toast("Speichern nicht möglich " + (r ?: ""))
             }
         }
     }
@@ -1251,6 +1528,27 @@ class MainActivity : Activity() {
                 if (down) handleMenuKey(code)
                 return true
             }
+            if (commentsOpen) {
+                if (down) {
+                    when (code) {
+                        KeyEvent.KEYCODE_DPAD_DOWN -> commentScroll.smoothScrollBy(0, dp(180))
+                        KeyEvent.KEYCODE_DPAD_UP -> commentScroll.smoothScrollBy(0, -dp(180))
+                        KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MENU -> closeComments()
+                    }
+                }
+                return true
+            }
+            if (actionMode) {
+                when (code) {
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
+                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                    KeyEvent.KEYCODE_BACK -> {
+                        if (down) handleActionKey(code)
+                        return true
+                    }
+                }
+            }
             when (code) {
                 KeyEvent.KEYCODE_MENU -> {
                     if (down) openMenu()
@@ -1267,7 +1565,7 @@ class MainActivity : Activity() {
                     if (down) player.playWhenReady = !player.playWhenReady
                     return true
                 }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) likeCurrent(false); return true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) enterActionMode(); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT -> { if (down) toggleMute(); return true }
                 KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) seekBy(-10000); return true }
                 KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) seekBy(10000); return true }
@@ -1321,6 +1619,7 @@ class IconView(context: Context, private val kind: Int) : View(context) {
         const val POWER = 8
         const val LOGO = 9
         const val PLAY = 10
+        const val BOOKMARK = 11
     }
 
     var tint: Int = Color.WHITE
@@ -1364,13 +1663,19 @@ class IconView(context: Context, private val kind: Int) : View(context) {
         when (kind) {
             HEART -> {
                 fill(tint)
-                canvas.drawCircle(0.3f * w, 0.34f * h, 0.22f * w, paint)
-                canvas.drawCircle(0.7f * w, 0.34f * h, 0.22f * w, paint)
+                val s = w / 20f
+                val oy = (h - 18.35f * s) / 2f
+                fun px(x: Float): Float = (x - 2f) * s
+                fun py(y: Float): Float = (y - 3f) * s + oy
                 path.reset()
-                path.moveTo(0.5f * w, 0.9f * h)
-                path.lineTo(0.09f * w, 0.46f * h)
-                path.lineTo(0.5f * w, 0.3f * h)
-                path.lineTo(0.91f * w, 0.46f * h)
+                path.moveTo(px(12f), py(21.35f))
+                path.lineTo(px(10.55f), py(20.03f))
+                path.cubicTo(px(5.4f), py(15.36f), px(2f), py(12.28f), px(2f), py(8.5f))
+                path.cubicTo(px(2f), py(5.42f), px(4.42f), py(3f), px(7.5f), py(3f))
+                path.cubicTo(px(9.24f), py(3f), px(10.91f), py(3.81f), px(12f), py(5.09f))
+                path.cubicTo(px(13.09f), py(3.81f), px(14.76f), py(3f), px(16.5f), py(3f))
+                path.cubicTo(px(19.58f), py(3f), px(22f), py(5.42f), px(22f), py(8.5f))
+                path.cubicTo(px(22f), py(12.28f), px(18.6f), py(15.36f), px(13.45f), py(20.04f))
                 path.close()
                 canvas.drawPath(path, paint)
             }
@@ -1387,6 +1692,19 @@ class IconView(context: Context, private val kind: Int) : View(context) {
                 canvas.drawCircle(0.3f * w, 0.46f * h, 0.055f * w, paint)
                 canvas.drawCircle(0.5f * w, 0.46f * h, 0.055f * w, paint)
                 canvas.drawCircle(0.7f * w, 0.46f * h, 0.055f * w, paint)
+            }
+            BOOKMARK -> {
+                path.reset()
+                path.moveTo(0.26f * w, 0.12f * h)
+                path.lineTo(0.74f * w, 0.12f * h)
+                path.lineTo(0.74f * w, 0.88f * h)
+                path.lineTo(0.5f * w, 0.66f * h)
+                path.lineTo(0.26f * w, 0.88f * h)
+                path.close()
+                fill(tint)
+                canvas.drawPath(path, paint)
+                stroke(tint, 0.06f * w)
+                canvas.drawPath(path, paint)
             }
             SHARE -> {
                 fill(tint)
