@@ -2,6 +2,7 @@ package com.example.tiktoktv
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -22,6 +23,7 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
+import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -30,6 +32,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -49,6 +52,7 @@ import org.json.JSONArray
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -78,8 +82,7 @@ class MainActivity : Activity() {
     private lateinit var surface: SurfaceView
     private lateinit var loadingView: TextView
     private lateinit var sidebar: LinearLayout
-    private lateinit var homeIcon: IconView
-    private lateinit var peopleIcon: IconView
+    private lateinit var topBar: LinearLayout
     private lateinit var rightCol: LinearLayout
     private lateinit var avatar: ImageView
     private lateinit var heartIcon: IconView
@@ -88,13 +91,23 @@ class MainActivity : Activity() {
     private lateinit var meta: LinearLayout
     private lateinit var tvLikeCount: TextView
     private lateinit var tvComCount: TextView
+    private lateinit var tvShrCount: TextView
     private lateinit var tvAuthor: TextView
     private lateinit var tvDesc: TextView
     private lateinit var progressFill: View
     private lateinit var player: ExoPlayer
+    private lateinit var fontRegular: Typeface
+    private lateinit var fontBold: Typeface
+
+    private val topTexts = ArrayList<TextView>()
+    private val topLines = ArrayList<View>()
+    private val topCells = ArrayList<LinearLayout>()
+    private val sideRows = ArrayList<LinearLayout>()
+    private val sideLabels = ArrayList<TextView>()
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideHint = Runnable { hint.animate().alpha(0f).setDuration(400).start() }
+    private val menuTimeout = Runnable { closeMenu() }
 
     private val items = ArrayList<Item>()
     private val seen = HashSet<String>()
@@ -105,6 +118,12 @@ class MainActivity : Activity() {
     @Volatile
     private var nativeActive = false
     private var onFollowing = false
+    private var onSearch = false
+    private var menuOpen = false
+    private var menuZone = 0
+    private var topIdx = 0
+    private var sideIdx = 0
+    private var roomForSidebar = true
     private var splashGone = false
     private var hintShownOnce = false
     private var reloadedOnce = false
@@ -120,7 +139,6 @@ class MainActivity : Activity() {
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     private val bgColor = Color.rgb(18, 18, 18)
-    private val dimColor = Color.rgb(110, 110, 110)
 
     // Liest die Videolisten mit, die TikTok selbst lädt
     private val hookJs = """
@@ -186,6 +204,10 @@ class MainActivity : Activity() {
                 } catch (e) {}
             }
 
+            function wanted(u) {
+                return u.indexOf('item_list') > -1 || u.indexOf('/search/') > -1;
+            }
+
             var of = window.fetch;
             if (of) {
                 window.fetch = function() {
@@ -193,7 +215,7 @@ class MainActivity : Activity() {
                     var p = of.apply(this, a);
                     try {
                         var u = (typeof a[0] === 'string') ? a[0] : ((a[0] && a[0].url) || '');
-                        if (u.indexOf('item_list') > -1) {
+                        if (wanted(u)) {
                             p.then(function(r) {
                                 r.clone().json().then(send).catch(function() {});
                             }).catch(function() {});
@@ -213,7 +235,7 @@ class MainActivity : Activity() {
                 var x = this;
                 x.addEventListener('load', function() {
                     try {
-                        if ((x.__u || '').indexOf('item_list') > -1) { send(JSON.parse(x.responseText)); }
+                        if (wanted(x.__u || '')) { send(JSON.parse(x.responseText)); }
                     } catch (e) {}
                 });
                 return os.apply(this, arguments);
@@ -228,17 +250,36 @@ class MainActivity : Activity() {
             document.addEventListener('DOMContentLoaded', ssr);
             setTimeout(ssr, 2000);
 
+            // Gefällt mir: erst über die Video-ID, sonst das Herz, das gerade mittig im Bild steht
             window.__tvLike = function(id) {
+                var SEL = '[data-e2e="like-icon"], [data-e2e="browse-like-icon"], button[aria-label*="like" i], button[aria-label*="gefällt" i]';
+                function clickIcon(ic) { (ic.closest('button') || ic).click(); }
+                var icons = document.querySelectorAll(SEL);
+                if (!icons.length) { return 'noicons:' + document.querySelectorAll('[data-e2e]').length; }
+
                 var as = document.querySelectorAll('a[href*="/video/' + id + '"]');
                 for (var i = 0; i < as.length; i++) {
                     var el = as[i];
                     for (var n = 0; n < 16 && el; n++) {
-                        var ic = el.querySelector ? el.querySelector('[data-e2e="like-icon"]') : null;
-                        if (ic) { (ic.closest('button') || ic).click(); return true; }
+                        if (el.querySelectorAll) {
+                            var found = el.querySelectorAll(SEL);
+                            if (found.length === 1) { clickIcon(found[0]); return 'ok-id'; }
+                            if (found.length > 1) { break; }
+                        }
                         el = el.parentElement;
                     }
                 }
-                return false;
+
+                var best = null;
+                var bd = 1e9;
+                var mid = window.innerHeight / 2;
+                for (var j = 0; j < icons.length; j++) {
+                    var r = icons[j].getBoundingClientRect();
+                    var d = Math.abs((r.top + r.bottom) / 2 - mid);
+                    if (d < bd) { bd = d; best = icons[j]; }
+                }
+                if (best) { clickIcon(best); return 'ok-pos'; }
+                return 'none';
             };
         })();
     """.trimIndent()
@@ -315,16 +356,33 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+    private fun loadFont(name: String): Typeface? = try {
+        Typeface.createFromAsset(assets, name)
+    } catch (e: Exception) {
+        null
+    }
+
     private fun label(size: Float, bold: Boolean = false): TextView = TextView(this).apply {
         setTextColor(Color.WHITE)
         textSize = size
         setShadowLayer(8f, 0f, 0f, Color.BLACK)
-        if (bold) typeface = Typeface.DEFAULT_BOLD
+        typeface = if (bold) fontBold else fontRegular
+    }
+
+    private fun pill(): GradientDrawable = GradientDrawable().apply {
+        cornerRadius = dp(14).toFloat()
+        setColor(Color.argb(80, 255, 255, 255))
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // TikTok Sans (wird beim Bauen heruntergeladen), sonst Systemschrift
+        val reg = loadFont("tiktoksans_regular.ttf")
+        fontRegular = reg ?: Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        fontBold = loadFont("tiktoksans_bold.ttf")
+            ?: (if (reg != null) Typeface.create(reg, Typeface.BOLD) else Typeface.create("sans-serif", Typeface.BOLD))
 
         val dm = resources.displayMetrics
         screenW = dm.widthPixels
@@ -353,18 +411,89 @@ class MainActivity : Activity() {
         surface = SurfaceView(this)
         playerLayer.addView(surface, FrameLayout.LayoutParams(screenW, screenH, Gravity.CENTER))
 
-        // Linke Leiste: Logo, Für dich, Folge ich
+        // Obere Leiste: Für dich | Folge ich | Suche
+        topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val names = listOf("Für dich", "Folge ich", "Suche")
+        for (i in names.indices) {
+            val cell = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(22), dp(8), dp(22), dp(8))
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            if (i == 2) {
+                row.addView(
+                    IconView(this, IconView.SEARCH),
+                    LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(8) }
+                )
+            }
+            val t = label(19f, true)
+            t.text = names[i]
+            row.addView(t)
+            val line = View(this)
+            line.setBackgroundColor(Color.WHITE)
+            cell.addView(row)
+            cell.addView(line, LinearLayout.LayoutParams(dp(28), dp(3)).apply { topMargin = dp(4) })
+            topBar.addView(cell, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dp(6)
+                marginEnd = dp(6)
+            })
+            topTexts.add(t)
+            topLines.add(line)
+            topCells.add(cell)
+        }
+        playerLayer.addView(topBar, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        ).apply { topMargin = dp(14) })
+
+        // Linke Leiste: Logo und Einstellungen
         sidebar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, dp(28), 0, dp(28))
+            setPadding(0, dp(24), 0, dp(24))
         }
-        sidebar.addView(IconView(this, IconView.LOGO), LinearLayout.LayoutParams(dp(42), dp(42)))
+        sidebar.addView(
+            IconView(this, IconView.LOGO),
+            LinearLayout.LayoutParams(dp(42), dp(42)).apply { gravity = Gravity.CENTER_HORIZONTAL }
+        )
         sidebar.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
-        homeIcon = IconView(this, IconView.HOME)
-        peopleIcon = IconView(this, IconView.PEOPLE)
-        sidebar.addView(homeIcon, LinearLayout.LayoutParams(dp(34), dp(34)).apply { bottomMargin = dp(30) })
-        sidebar.addView(peopleIcon, LinearLayout.LayoutParams(dp(34), dp(34)))
+        val sideDefs = listOf(
+            Pair(IconView.SPEAKER, "Ton an/aus"),
+            Pair(IconView.REFRESH, "Neu laden"),
+            Pair(IconView.PERSON, "Abmelden"),
+            Pair(IconView.POWER, "Beenden")
+        )
+        for (d in sideDefs) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(12), dp(10), dp(12))
+            }
+            row.addView(IconView(this, d.first), LinearLayout.LayoutParams(dp(30), dp(30)))
+            val tv = label(18f, true)
+            tv.text = d.second
+            tv.visibility = View.GONE
+            row.addView(tv, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(16) })
+            sidebar.addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(8)
+                marginStart = dp(8)
+                marginEnd = dp(8)
+            })
+            sideRows.add(row)
+            sideLabels.add(tv)
+        }
         sidebar.addView(View(this), LinearLayout.LayoutParams(1, 0, 1.4f))
         playerLayer.addView(sidebar, FrameLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START))
 
@@ -378,12 +507,20 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(8) })
         playerLayer.addView(meta, FrameLayout.LayoutParams(
             dp(300), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
-        ).apply { marginStart = dp(28); bottomMargin = dp(36) })
+        ).apply { marginStart = dp(100); bottomMargin = dp(36) })
 
-        // Rechts neben dem Video: Profilbild, Herz, Kommentare, Mehr
+        // Rechts neben dem Video: Profilbild, Herz, Kommentare, Teilen
         rightCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val avatarBox = FrameLayout(this)
+        val ring = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.WHITE)
+            }
+            setPadding(dp(2), dp(2), dp(2), dp(2))
         }
         avatar = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -395,25 +532,37 @@ class MainActivity : Activity() {
                 }
             }
         }
-        rightCol.addView(avatar, LinearLayout.LayoutParams(dp(60), dp(60)).apply { bottomMargin = dp(26) })
+        ring.addView(avatar, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        avatarBox.addView(ring, FrameLayout.LayoutParams(dp(60), dp(60)))
+        avatarBox.addView(
+            IconView(this, IconView.PLUS_BADGE),
+            FrameLayout.LayoutParams(dp(24), dp(24), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        )
+        rightCol.addView(avatarBox, LinearLayout.LayoutParams(dp(60), dp(72)).apply { bottomMargin = dp(16) })
 
         heartIcon = IconView(this, IconView.HEART)
-        rightCol.addView(heartIcon, LinearLayout.LayoutParams(dp(42), dp(42)))
-        tvLikeCount = label(16f, true).apply { gravity = Gravity.CENTER }
+        rightCol.addView(heartIcon, LinearLayout.LayoutParams(dp(44), dp(44)))
+        tvLikeCount = label(15f, true).apply { gravity = Gravity.CENTER }
         rightCol.addView(tvLikeCount, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(22) })
+        ).apply { bottomMargin = dp(18) })
 
-        rightCol.addView(IconView(this, IconView.COMMENT), LinearLayout.LayoutParams(dp(42), dp(42)))
-        tvComCount = label(16f, true).apply { gravity = Gravity.CENTER }
+        rightCol.addView(IconView(this, IconView.COMMENT), LinearLayout.LayoutParams(dp(44), dp(44)))
+        tvComCount = label(15f, true).apply { gravity = Gravity.CENTER }
         rightCol.addView(tvComCount, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = dp(22) })
+        ).apply { bottomMargin = dp(18) })
 
-        rightCol.addView(IconView(this, IconView.MORE), LinearLayout.LayoutParams(dp(42), dp(30)))
+        rightCol.addView(IconView(this, IconView.SHARE), LinearLayout.LayoutParams(dp(44), dp(44)))
+        tvShrCount = label(15f, true).apply { gravity = Gravity.CENTER }
+        rightCol.addView(tvShrCount, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
         playerLayer.addView(rightCol, FrameLayout.LayoutParams(
             dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
-        ).apply { marginStart = dp(700); bottomMargin = dp(36) })
+        ).apply { marginStart = dp(700); bottomMargin = dp(30) })
 
         // Fortschrittsbalken ganz unten
         val progressBg = FrameLayout(this).apply { setBackgroundColor(Color.argb(60, 255, 255, 255)) }
@@ -464,9 +613,10 @@ class MainActivity : Activity() {
         root.addView(splash)
 
         hint = TextView(this).apply {
-            text = "↑ ↓  Video     OK  Pause     OK 2×  Gefällt mir     ←  Ton     →  Gefällt mir     Menü  Für dich / Folge ich"
+            text = "↑ ↓ Video     OK Pause     OK 2× Gefällt mir     ← Ton     → Gefällt mir     Menü  Navigation"
             setTextColor(Color.WHITE)
             textSize = 16f
+            typeface = fontRegular
             gravity = Gravity.CENTER
             setPadding(48, 24, 48, 24)
             background = GradientDrawable().apply {
@@ -477,14 +627,14 @@ class MainActivity : Activity() {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply { topMargin = 48 }
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            ).apply { bottomMargin = dp(60) }
         }
         root.addView(hint)
 
         setContentView(root)
 
-        updateSidebar()
+        renderMenu()
         setupPlayer()
         setupWebView()
 
@@ -646,6 +796,7 @@ class MainActivity : Activity() {
         tvDesc.text = ""
         tvLikeCount.text = ""
         tvComCount.text = ""
+        tvShrCount.text = ""
         avatar.setImageDrawable(null)
         currentAvatarUrl = ""
     }
@@ -664,6 +815,7 @@ class MainActivity : Activity() {
         tvDesc.text = it.desc
         tvLikeCount.text = fmt(it.likes)
         tvComCount.text = fmt(it.comments)
+        tvShrCount.text = fmt(it.shares)
         heartIcon.tint = if (it.liked) Color.rgb(254, 44, 85) else Color.WHITE
         progressFill.scaleX = 0f
         loadAvatar(it.avatar)
@@ -700,11 +852,6 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun updateSidebar() {
-        homeIcon.tint = if (onFollowing) dimColor else Color.WHITE
-        peopleIcon.tint = if (onFollowing) Color.WHITE else dimColor
-    }
-
     private fun fitVideo(vs: VideoSize) {
         if (vs.width == 0 || vs.height == 0) return
         val ratio = vs.width * vs.pixelWidthHeightRatio / vs.height
@@ -721,25 +868,30 @@ class MainActivity : Activity() {
 
         val side = (screenW - vw) / 2
         val roomy = side >= dp(260)
-        sidebar.visibility = if (side >= dp(90)) View.VISIBLE else View.GONE
+        roomForSidebar = side >= dp(90)
+        updateSidebarVisibility()
 
         // Bedienelemente rechts neben dem Video (bei Querformat im Bild)
         rightCol.layoutParams = FrameLayout.LayoutParams(
             dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
         ).apply {
             marginStart = if (roomy) side + vw + dp(16) else maxOf(0, side + vw - dp(100))
-            bottomMargin = dp(36)
+            bottomMargin = dp(30)
         }
 
         // Name und Beschreibung links neben dem Video (bei Querformat im Bild)
         meta.layoutParams = FrameLayout.LayoutParams(
-            if (roomy) side - dp(28) - dp(24) else maxOf(dp(200), vw - dp(140)),
+            if (roomy) side - dp(100) - dp(24) else maxOf(dp(200), vw - dp(140)),
             ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.START or Gravity.BOTTOM
         ).apply {
-            marginStart = if (roomy) dp(28) else side + dp(24)
+            marginStart = if (roomy) dp(100) else side + dp(24)
             bottomMargin = dp(36)
         }
+    }
+
+    private fun updateSidebarVisibility() {
+        sidebar.visibility = if (menuOpen || roomForSidebar) View.VISIBLE else View.GONE
     }
 
     private val progressTicker = object : Runnable {
@@ -764,6 +916,172 @@ class MainActivity : Activity() {
         heartPop.animate().scaleX(1.15f).scaleY(1.15f).alpha(0f).setDuration(700).start()
     }
 
+    // ---------- Menü (Menü-Taste) ----------
+
+    private fun activeTab(): Int = if (onSearch) 2 else if (onFollowing) 1 else 0
+
+    private fun renderMenu() {
+        val active = activeTab()
+        for (i in topTexts.indices) {
+            topTexts[i].setTextColor(if (i == active) Color.WHITE else Color.argb(170, 255, 255, 255))
+            topLines[i].visibility = if (i == active) View.VISIBLE else View.INVISIBLE
+            topCells[i].background = if (menuOpen && menuZone == 0 && i == topIdx) pill() else null
+        }
+        for (i in sideRows.indices) {
+            sideRows[i].background = if (menuOpen && menuZone == 1 && i == sideIdx) pill() else null
+            sideLabels[i].visibility = if (menuOpen) View.VISIBLE else View.GONE
+            sideRows[i].gravity = if (menuOpen) (Gravity.START or Gravity.CENTER_VERTICAL) else Gravity.CENTER
+        }
+        topBar.background = if (menuOpen) GradientDrawable().apply {
+            cornerRadius = dp(30).toFloat()
+            setColor(Color.argb(190, 0, 0, 0))
+        } else null
+        sidebar.setBackgroundColor(if (menuOpen) Color.argb(215, 0, 0, 0) else Color.TRANSPARENT)
+        val lp = sidebar.layoutParams as FrameLayout.LayoutParams
+        lp.width = if (menuOpen) dp(250) else dp(72)
+        sidebar.layoutParams = lp
+        updateSidebarVisibility()
+    }
+
+    private fun openMenu() {
+        menuOpen = true
+        menuZone = 0
+        topIdx = activeTab()
+        sideIdx = 0
+        scheduleMenuClose()
+        renderMenu()
+    }
+
+    private fun closeMenu() {
+        menuOpen = false
+        handler.removeCallbacks(menuTimeout)
+        renderMenu()
+    }
+
+    private fun scheduleMenuClose() {
+        handler.removeCallbacks(menuTimeout)
+        handler.postDelayed(menuTimeout, 10000)
+    }
+
+    private fun handleMenuKey(code: Int) {
+        scheduleMenuClose()
+        when (code) {
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_MENU -> {
+                closeMenu()
+                return
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (menuZone == 0) {
+                    if (topIdx > 0) topIdx-- else menuZone = 1
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (menuZone == 0) {
+                    if (topIdx < topCells.size - 1) topIdx++
+                } else {
+                    menuZone = 0
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (menuZone == 0) {
+                    menuZone = 1
+                    sideIdx = 0
+                } else if (sideIdx < sideRows.size - 1) {
+                    sideIdx++
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                if (menuZone == 1) {
+                    if (sideIdx > 0) sideIdx-- else menuZone = 0
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                activateMenu()
+                return
+            }
+        }
+        renderMenu()
+    }
+
+    private fun activateMenu() {
+        val zone = menuZone
+        val top = topIdx
+        val side = sideIdx
+        closeMenu()
+        if (zone == 0) {
+            when (top) {
+                0 -> openFeed(feedUrl, "Für dich")
+                1 -> openFeed(followingUrl, "Folge ich")
+                2 -> showSearchDialog()
+            }
+        } else {
+            when (side) {
+                0 -> toggleMute()
+                1 -> reloadFeed()
+                2 -> logout()
+                3 -> finish()
+            }
+        }
+    }
+
+    private fun openFeed(url: String, name: String) {
+        resetFeed()
+        onSearch = false
+        webView.loadUrl(url)
+        toast(name)
+    }
+
+    private fun reloadFeed() {
+        resetFeed()
+        webView.reload()
+        toast("Lädt neu …")
+    }
+
+    private fun logout() {
+        CookieManager.getInstance().removeAllCookies(null)
+        CookieManager.getInstance().flush()
+        resetFeed()
+        setNative(false)
+        webView.clearCache(true)
+        webView.loadUrl(startUrl)
+        toast("Abgemeldet")
+    }
+
+    private fun showSearchDialog() {
+        val input = EditText(this).apply {
+            hint = "Suchbegriff"
+            setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            typeface = fontRegular
+            setPadding(dp(24), dp(16), dp(24), dp(16))
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Suche")
+            .setView(input)
+            .setPositiveButton("Suchen") { _, _ -> doSearch(input.text.toString()) }
+            .setNegativeButton("Abbrechen", null)
+            .create()
+        input.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                dlg.dismiss()
+                doSearch(input.text.toString())
+                true
+            } else {
+                false
+            }
+        }
+        dlg.show()
+    }
+
+    private fun doSearch(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        resetFeed()
+        onSearch = true
+        webView.loadUrl("https://www.tiktok.com/search/video?q=" + URLEncoder.encode(q, "UTF-8"))
+        toast("Suche: " + q)
+    }
+
     // ---------- Modus ----------
 
     private fun updateMode(url: String?) {
@@ -775,8 +1093,9 @@ class MainActivity : Activity() {
             return
         }
         onFollowing = url.contains("tiktok.com/following")
-        updateSidebar()
-        val isFeed = url.contains("tiktok.com/foryou") || onFollowing
+        onSearch = url.contains("tiktok.com/search")
+        renderMenu()
+        val isFeed = url.contains("tiktok.com/foryou") || onFollowing || onSearch
         setNative(isFeed)
     }
 
@@ -807,6 +1126,7 @@ class MainActivity : Activity() {
             webView.alpha = 1f
             playerLayer.visibility = View.GONE
             player.playWhenReady = false
+            menuOpen = false
         }
     }
 
@@ -877,14 +1197,16 @@ class MainActivity : Activity() {
             showHeartPop()
             return
         }
-        webView.evaluateJavascript("window.__tvLike && window.__tvLike('" + item.id + "');") { r ->
-            if (r == "true") {
+        webView.evaluateJavascript(
+            "window.__tvLike ? window.__tvLike('" + item.id + "') : 'nofn';"
+        ) { r ->
+            if (r != null && r.contains("ok")) {
                 item.liked = !item.liked
                 item.likes += if (item.liked) 1 else -1
                 if (item.liked) showHeartPop()
                 if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
             } else {
-                toast("Gefällt mir gerade nicht möglich")
+                toast("Gefällt mir nicht möglich " + (r ?: ""))
             }
         }
     }
@@ -925,14 +1247,13 @@ class MainActivity : Activity() {
         val down = event.action == KeyEvent.ACTION_DOWN
 
         if (nativeActive) {
+            if (menuOpen) {
+                if (down) handleMenuKey(code)
+                return true
+            }
             when (code) {
                 KeyEvent.KEYCODE_MENU -> {
-                    if (down) {
-                        val toFollowing = !onFollowing
-                        resetFeed()
-                        webView.loadUrl(if (toFollowing) followingUrl else feedUrl)
-                        toast(if (toFollowing) "Folge ich" else "Für dich")
-                    }
+                    if (down) openMenu()
                     return true
                 }
                 KeyEvent.KEYCODE_DPAD_DOWN -> { if (down) nextVideo(); return true }
@@ -985,17 +1306,21 @@ class MainActivity : Activity() {
     }
 }
 
-// Einfache, selbst gezeichnete Symbole (kein Emoji, daher auf jedem Gerät gleich)
+// Selbst gezeichnete Symbole im Stil deiner Vorlage
 class IconView(context: Context, private val kind: Int) : View(context) {
 
     companion object {
         const val HEART = 0
         const val COMMENT = 1
-        const val MORE = 2
-        const val HOME = 3
-        const val PEOPLE = 4
-        const val LOGO = 5
-        const val PLAY = 6
+        const val SHARE = 2
+        const val PLUS_BADGE = 3
+        const val PERSON = 4
+        const val SEARCH = 5
+        const val SPEAKER = 6
+        const val REFRESH = 7
+        const val POWER = 8
+        const val LOGO = 9
+        const val PLAY = 10
     }
 
     var tint: Int = Color.WHITE
@@ -1008,69 +1333,133 @@ class IconView(context: Context, private val kind: Int) : View(context) {
     private val path = Path()
     private val rect = RectF()
 
-    private fun note(canvas: Canvas, w: Float, h: Float, dx: Float, color: Int) {
-        paint.color = color
+    private fun fill(c: Int) {
+        paint.style = Paint.Style.FILL
+        paint.color = c
+    }
+
+    private fun stroke(c: Int, sw: Float) {
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 0.12f * w
+        paint.color = c
+        paint.strokeWidth = sw
         paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
+    }
+
+    private fun note(canvas: Canvas, w: Float, h: Float, dx: Float, color: Int) {
+        stroke(color, 0.12f * w)
         canvas.drawLine(0.58f * w + dx, 0.14f * h, 0.58f * w + dx, 0.68f * h, paint)
         path.reset()
         path.moveTo(0.58f * w + dx, 0.14f * h)
         path.quadTo(0.66f * w + dx, 0.34f * h, 0.88f * w + dx, 0.34f * h)
         canvas.drawPath(path, paint)
-        paint.style = Paint.Style.FILL
+        fill(color)
         canvas.drawCircle(0.4f * w + dx, 0.72f * h, 0.17f * w, paint)
     }
 
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
-        paint.style = Paint.Style.FILL
-        paint.color = tint
-        paint.strokeWidth = 0f
 
         when (kind) {
             HEART -> {
+                fill(tint)
+                canvas.drawCircle(0.3f * w, 0.34f * h, 0.22f * w, paint)
+                canvas.drawCircle(0.7f * w, 0.34f * h, 0.22f * w, paint)
                 path.reset()
-                path.moveTo(0.5f * w, 0.88f * h)
-                path.cubicTo(0.05f * w, 0.55f * h, 0.08f * w, 0.15f * h, 0.3f * w, 0.15f * h)
-                path.cubicTo(0.42f * w, 0.15f * h, 0.5f * w, 0.25f * h, 0.5f * w, 0.32f * h)
-                path.cubicTo(0.5f * w, 0.25f * h, 0.58f * w, 0.15f * h, 0.7f * w, 0.15f * h)
-                path.cubicTo(0.92f * w, 0.15f * h, 0.95f * w, 0.55f * h, 0.5f * w, 0.88f * h)
+                path.moveTo(0.5f * w, 0.9f * h)
+                path.lineTo(0.09f * w, 0.46f * h)
+                path.lineTo(0.5f * w, 0.3f * h)
+                path.lineTo(0.91f * w, 0.46f * h)
                 path.close()
                 canvas.drawPath(path, paint)
             }
             COMMENT -> {
-                rect.set(0.08f * w, 0.12f * h, 0.92f * w, 0.72f * h)
-                canvas.drawRoundRect(rect, 0.16f * w, 0.16f * w, paint)
+                fill(tint)
+                canvas.drawCircle(0.5f * w, 0.46f * h, 0.4f * w, paint)
                 path.reset()
-                path.moveTo(0.26f * w, 0.66f * h)
-                path.lineTo(0.26f * w, 0.9f * h)
-                path.lineTo(0.5f * w, 0.68f * h)
+                path.moveTo(0.55f * w, 0.8f * h)
+                path.lineTo(0.84f * w, 0.96f * h)
+                path.lineTo(0.8f * w, 0.66f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+                fill(Color.rgb(35, 35, 35))
+                canvas.drawCircle(0.3f * w, 0.46f * h, 0.055f * w, paint)
+                canvas.drawCircle(0.5f * w, 0.46f * h, 0.055f * w, paint)
+                canvas.drawCircle(0.7f * w, 0.46f * h, 0.055f * w, paint)
+            }
+            SHARE -> {
+                fill(tint)
+                path.reset()
+                path.moveTo(0.6f * w, 0.1f * h)
+                path.lineTo(0.96f * w, 0.46f * h)
+                path.lineTo(0.6f * w, 0.82f * h)
+                path.lineTo(0.6f * w, 0.62f * h)
+                path.cubicTo(0.3f * w, 0.6f * h, 0.15f * w, 0.74f * h, 0.07f * w, 0.92f * h)
+                path.cubicTo(0.07f * w, 0.52f * h, 0.28f * w, 0.32f * h, 0.6f * w, 0.3f * h)
                 path.close()
                 canvas.drawPath(path, paint)
             }
-            MORE -> {
-                canvas.drawCircle(0.2f * w, 0.5f * h, 0.09f * w, paint)
-                canvas.drawCircle(0.5f * w, 0.5f * h, 0.09f * w, paint)
-                canvas.drawCircle(0.8f * w, 0.5f * h, 0.09f * w, paint)
+            PLUS_BADGE -> {
+                fill(Color.rgb(254, 44, 85))
+                canvas.drawCircle(0.5f * w, 0.5f * h, 0.5f * w, paint)
+                stroke(Color.WHITE, 0.11f * w)
+                canvas.drawLine(0.28f * w, 0.5f * h, 0.72f * w, 0.5f * h, paint)
+                canvas.drawLine(0.5f * w, 0.28f * h, 0.5f * w, 0.72f * h, paint)
             }
-            HOME -> {
+            PERSON -> {
+                stroke(tint, 0.09f * w)
+                canvas.drawCircle(0.5f * w, 0.3f * h, 0.17f * w, paint)
+                rect.set(0.18f * w, 0.56f * h, 0.82f * w, 1.2f * h)
+                canvas.drawArc(rect, 180f, 180f, false, paint)
+            }
+            SEARCH -> {
+                stroke(tint, 0.1f * w)
+                canvas.drawCircle(0.42f * w, 0.42f * h, 0.25f * w, paint)
+                canvas.drawLine(0.6f * w, 0.6f * h, 0.85f * w, 0.85f * h, paint)
+            }
+            SPEAKER -> {
+                fill(tint)
+                canvas.drawRect(0.1f * w, 0.4f * h, 0.3f * w, 0.6f * h, paint)
                 path.reset()
-                path.moveTo(0.5f * w, 0.1f * h)
-                path.lineTo(0.94f * w, 0.5f * h)
-                path.lineTo(0.06f * w, 0.5f * h)
+                path.moveTo(0.28f * w, 0.4f * h)
+                path.lineTo(0.52f * w, 0.2f * h)
+                path.lineTo(0.52f * w, 0.8f * h)
+                path.lineTo(0.28f * w, 0.6f * h)
                 path.close()
                 canvas.drawPath(path, paint)
-                canvas.drawRect(0.18f * w, 0.48f * h, 0.82f * w, 0.9f * h, paint)
+                stroke(tint, 0.08f * w)
+                rect.set(0.35f * w, 0.3f * h, 0.75f * w, 0.7f * h)
+                canvas.drawArc(rect, -50f, 100f, false, paint)
+                rect.set(0.3f * w, 0.16f * h, 0.92f * w, 0.84f * h)
+                canvas.drawArc(rect, -50f, 100f, false, paint)
             }
-            PEOPLE -> {
-                canvas.drawCircle(0.36f * w, 0.32f * h, 0.15f * w, paint)
-                rect.set(0.1f * w, 0.55f * h, 0.62f * w, 0.9f * h)
-                canvas.drawRoundRect(rect, 0.2f * w, 0.2f * w, paint)
-                canvas.drawCircle(0.7f * w, 0.38f * h, 0.12f * w, paint)
-                rect.set(0.54f * w, 0.6f * h, 0.92f * w, 0.9f * h)
-                canvas.drawRoundRect(rect, 0.16f * w, 0.16f * w, paint)
+            REFRESH -> {
+                stroke(tint, 0.1f * w)
+                rect.set(0.2f * w, 0.2f * h, 0.8f * w, 0.8f * h)
+                canvas.drawArc(rect, -60f, 280f, false, paint)
+                // Pfeilspitze am Ende des Bogens
+                val px = 0.27f * w
+                val py = 0.307f * h
+                val dx = 0.643f
+                val dy = -0.766f
+                val tipX = px + dx * 0.16f * w
+                val tipY = py + dy * 0.16f * h
+                val nx = -dy
+                val ny = dx
+                fill(tint)
+                path.reset()
+                path.moveTo(tipX, tipY)
+                path.lineTo(px + nx * 0.13f * w, py + ny * 0.13f * h)
+                path.lineTo(px - nx * 0.13f * w, py - ny * 0.13f * h)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+            POWER -> {
+                stroke(tint, 0.1f * w)
+                rect.set(0.2f * w, 0.22f * h, 0.8f * w, 0.82f * h)
+                canvas.drawArc(rect, -60f, 300f, false, paint)
+                canvas.drawLine(0.5f * w, 0.1f * h, 0.5f * w, 0.5f * h, paint)
             }
             LOGO -> {
                 note(canvas, w, h, -0.03f * w, Color.rgb(37, 244, 238))
@@ -1078,6 +1467,7 @@ class IconView(context: Context, private val kind: Int) : View(context) {
                 note(canvas, w, h, 0f, Color.WHITE)
             }
             PLAY -> {
+                fill(tint)
                 path.reset()
                 path.moveTo(0.25f * w, 0.15f * h)
                 path.lineTo(0.9f * w, 0.5f * h)
