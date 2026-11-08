@@ -20,6 +20,20 @@ jobs:
         with:
           gradle-version: 8.7
 
+      - name: Download TikTok Sans
+        continue-on-error: true
+        run: |
+          mkdir -p app/src/main/assets /tmp/ts
+          curl -fL --retry 2 -o /tmp/ts/font.zip "https://fonts.google.com/download?family=TikTok%20Sans" || curl -fL -o /tmp/ts/font.zip "https://github.com/tiktok/TikTokSans/archive/refs/heads/main.zip"
+          unzip -o -q /tmp/ts/font.zip -d /tmp/ts/x
+          find /tmp/ts/x -iname "*.ttf" | sort
+          REG=$(find /tmp/ts/x -iname "*Regular*.ttf" | grep -vi -e italic -e oblique | sort | head -n1)
+          BOLD=$(find /tmp/ts/x -iname "*Bold*.ttf" | grep -vi -e italic -e oblique -e semi -e extra | sort | head -n1)
+          if [ -z "$REG" ]; then REG=$(find /tmp/ts/x -iname "*.ttf" | sort | head -n1); fi
+          if [ -n "$REG" ]; then cp "$REG" app/src/main/assets/tiktoksans_regular.ttf; fi
+          if [ -n "$BOLD" ]; then cp "$BOLD" app/src/main/assets/tiktoksans_bold.ttf; fi
+          ls -la app/src/main/assets
+
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
