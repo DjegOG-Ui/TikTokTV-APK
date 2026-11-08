@@ -3,6 +3,8 @@ package com.example.tiktoktv
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -123,9 +125,11 @@ class MainActivity : Activity() {
 
     private val items = ArrayList<Item>()
     private val seen = HashSet<String>()
+    private val pendingApi = HashMap<String, Boolean>()
     private val avatarCache = ConcurrentHashMap<String, Bitmap>()
     private var currentAvatarUrl = ""
     private var centerPending: Runnable? = null
+    private var lastDiag = 0L
 
     @Volatile
     private var nativeActive = false
@@ -140,7 +144,6 @@ class MainActivity : Activity() {
     private var commentsOpen = false
     private var commentGot = false
     private var commentRetried = false
-    private var pagePanelOpen = false
     private var roomForSidebar = true
     private var splashGone = false
     private var hintShownOnce = false
@@ -160,7 +163,7 @@ class MainActivity : Activity() {
     private val savedColor = Color.rgb(250, 206, 21)
     private val likedColor = Color.rgb(254, 44, 85)
 
-    // Liest Videolisten und Kommentare mit, die TikTok selbst lädt
+    // Liest Videolisten und Kommentare mit und ruft TikToks Funktionen aus der Seite heraus auf
     private val hookJs = """
         (function() {
             if (window.__tvHook) { return; }
@@ -254,6 +257,38 @@ class MainActivity : Activity() {
                 else { send(json); }
             }
 
+            // Gemeinsame Anfrage-Parameter von TikToks eigenen Aufrufen merken
+            var SKIP = {'x-bogus': 1, 'x-gnarly': 1, 'mstoken': 1, '_signature': 1, 'count': 1, 'cursor': 1,
+                'itemid': 1, 'item_id': 1, 'secuid': 1, 'id': 1, 'coverformat': 1, 'keyword': 1, 'offset': 1,
+                'aweme_id': 1, 'type': 1, 'action': 1};
+            var DEFAULT_BASE = {
+                aid: '1988', app_language: 'de', app_name: 'tiktok_web', browser_language: 'de-DE',
+                browser_name: 'Mozilla', browser_online: 'true', browser_platform: 'Linux%20x86_64',
+                channel: 'tiktok_web', cookie_enabled: 'true', device_platform: 'web_pc', focus_state: 'true',
+                from_page: 'fyp', is_fullscreen: 'false', is_page_visible: 'true', os: 'linux',
+                priority_region: '', referer: '', region: 'DE', screen_height: '1080', screen_width: '1920',
+                tz_name: 'Europe%2FBerlin', webcast_language: 'de-DE'
+            };
+            function learn(u) {
+                try {
+                    if (!u || u.indexOf('/api/') < 0 || u.indexOf('aid=') < 0) { return; }
+                    var isList = u.indexOf('item_list') > -1;
+                    if (window.__tvBase && !isList) { return; }
+                    var q = u.split('?')[1];
+                    if (!q) { return; }
+                    var parts = q.split('&');
+                    var o = {};
+                    for (var i = 0; i < parts.length; i++) {
+                        var eq = parts[i].indexOf('=');
+                        if (eq < 1) { continue; }
+                        var k = parts[i].substring(0, eq);
+                        if (SKIP[k.toLowerCase()]) { continue; }
+                        o[k] = parts[i].substring(eq + 1);
+                    }
+                    window.__tvBase = o;
+                } catch (e) {}
+            }
+
             var of = window.fetch;
             if (of) {
                 window.fetch = function() {
@@ -261,6 +296,7 @@ class MainActivity : Activity() {
                     var p = of.apply(this, a);
                     try {
                         var u = (typeof a[0] === 'string') ? a[0] : ((a[0] && a[0].url) || '');
+                        learn(u);
                         if (wanted(u)) {
                             p.then(function(r) {
                                 r.clone().json().then(function(j) { handle(u, j); }).catch(function() {});
@@ -274,6 +310,7 @@ class MainActivity : Activity() {
             var oo = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(m, u) {
                 this.__u = u;
+                try { learn(String(u)); } catch (e) {}
                 return oo.apply(this, arguments);
             };
             var os = XMLHttpRequest.prototype.send;
@@ -297,8 +334,66 @@ class MainActivity : Activity() {
             document.addEventListener('DOMContentLoaded', ssr);
             setTimeout(ssr, 2000);
 
-            // Klickt Herz, Kommentare oder Speichern des aktuellen Videos auf der unsichtbaren Seite.
-            // Erst über die Video-ID, sonst das Symbol, das gerade mittig im Bild steht.
+            function build(path, params) {
+                var o = {};
+                var b = window.__tvBase || DEFAULT_BASE;
+                for (var k in b) { o[k] = b[k]; }
+                for (var p in params) { o[p] = encodeURIComponent(params[p]); }
+                var parts = [];
+                for (var n in o) { parts.push(n + '=' + o[n]); }
+                return location.origin + path + '?' + parts.join('&');
+            }
+
+            function report(kind, id, ok, info) {
+                try {
+                    if (window.AndroidBridge && window.AndroidBridge.onApi) {
+                        window.AndroidBridge.onApi(kind, id, !!ok, String(info));
+                    }
+                } catch (e) {}
+            }
+
+            // Like / Speichern / Kommentare über TikToks eigene Web-Schnittstelle (mit deiner Anmeldung)
+            window.__tvApi = function(kind, id, on) {
+                var url;
+                var method = 'POST';
+                if (kind === 'like') {
+                    url = build('/api/commit/item/digg/', {aweme_id: id, type: on ? 1 : 0});
+                } else if (kind === 'save') {
+                    url = build('/api/item/collect/', {aweme_id: id, action: on ? 1 : 0});
+                } else if (kind === 'comment') {
+                    url = build('/api/comment/list/', {aweme_id: id, count: 20, cursor: 0});
+                    method = 'GET';
+                } else {
+                    return 'nokind';
+                }
+                fetch(url, {
+                    method: method,
+                    credentials: 'include',
+                    headers: {'Accept': 'application/json, text/plain, */*'}
+                }).then(function(r) {
+                    return r.text().then(function(t) { return {s: r.status, t: t}; });
+                }).then(function(x) {
+                    var j = null;
+                    try { j = JSON.parse(x.t); } catch (e) {}
+                    if (!j) { report(kind, id, false, 'http' + x.s + ':' + x.t.substring(0, 40)); return; }
+                    var sc = (j.status_code !== undefined) ? j.status_code : j.statusCode;
+                    if (kind === 'comment') {
+                        if (j.comments || sc === 0) {
+                            sendComments(j.comments ? j : {comments: []});
+                            report(kind, id, true, 'n');
+                        } else {
+                            report(kind, id, false, 'sc' + sc + ':' + (j.status_msg || 'nocomments'));
+                        }
+                        return;
+                    }
+                    report(kind, id, sc === 0, 'sc' + sc + ':' + (j.status_msg || ''));
+                }).catch(function(e) {
+                    report(kind, id, false, 'err:' + e);
+                });
+                return 'sent';
+            };
+
+            // Reserve: Symbol des aktuellen Videos auf der Seite anklicken
             var SELS = {
                 like: '[data-e2e="like-icon"], [data-e2e="browse-like-icon"], button[aria-label*="like" i], button[aria-label*="gefällt" i]',
                 comment: '[data-e2e="comment-icon"], [data-e2e="browse-comment-icon"], button[aria-label*="comment" i], button[aria-label*="kommentar" i]',
@@ -310,20 +405,6 @@ class MainActivity : Activity() {
                 function clickIcon(ic) { (ic.closest('button') || ic).click(); }
                 var icons = document.querySelectorAll(SEL);
                 if (!icons.length) { return 'noicons-' + kind + ':' + document.querySelectorAll('[data-e2e]').length; }
-
-                var as = document.querySelectorAll('a[href*="/video/' + id + '"]');
-                for (var i = 0; i < as.length; i++) {
-                    var el = as[i];
-                    for (var n = 0; n < 16 && el; n++) {
-                        if (el.querySelectorAll) {
-                            var found = el.querySelectorAll(SEL);
-                            if (found.length === 1) { clickIcon(found[0]); return 'ok-id'; }
-                            if (found.length > 1) { break; }
-                        }
-                        el = el.parentElement;
-                    }
-                }
-
                 var best = null;
                 var bd = 1e9;
                 var mid = window.innerHeight / 2;
@@ -334,6 +415,20 @@ class MainActivity : Activity() {
                 }
                 if (best) { clickIcon(best); return 'ok-pos'; }
                 return 'none';
+            };
+
+            // Fehlersuche: zeigt, was auf der unsichtbaren Seite vorhanden ist
+            window.__tvDiag = function() {
+                var seenN = {};
+                var names = [];
+                var els = document.querySelectorAll('[data-e2e]');
+                for (var i = 0; i < els.length; i++) {
+                    var n = els[i].getAttribute('data-e2e');
+                    if (!seenN[n]) { seenN[n] = 1; names.push(n); }
+                }
+                var bk = window.__tvBase ? Object.keys(window.__tvBase).length : -1;
+                return 'seite=' + location.pathname + ' basis=' + bk + ' elemente=' + els.length +
+                    ' namen=' + names.slice(0, 40).join(',');
             };
         })();
     """.trimIndent()
@@ -410,6 +505,11 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun onComments(json: String) {
             runOnUiThread { showComments(json) }
+        }
+
+        @JavascriptInterface
+        fun onApi(kind: String, id: String, ok: Boolean, info: String) {
+            runOnUiThread { handleApi(kind, id, ok, info) }
         }
     }
 
@@ -635,7 +735,7 @@ class MainActivity : Activity() {
         actionCells.add(makeAction(saveIcon, tvSaveCount))
 
         tvShrCount = label(15f, true).apply { gravity = Gravity.CENTER }
-        makeAction(IconView(this, IconView.SHARE), tvShrCount)
+        actionCells.add(makeAction(IconView(this, IconView.SHARE), tvShrCount))
 
         playerLayer.addView(rightCol, FrameLayout.LayoutParams(
             dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
@@ -712,7 +812,7 @@ class MainActivity : Activity() {
         root.addView(splash)
 
         hint = TextView(this).apply {
-            text = "↑ ↓ Video     OK Pause     OK 2× Gefällt mir     → Herz / Kommentare / Speichern     ← Ton     Menü  Navigation"
+            text = "↑ ↓ Video     OK Pause     OK 2× Gefällt mir     → Herz / Kommentare / Speichern / Teilen     ← Ton     Menü  Navigation"
             setTextColor(Color.WHITE)
             textSize = 16f
             typeface = fontRegular
@@ -748,1051 +848,3 @@ class MainActivity : Activity() {
         val http = DefaultHttpDataSource.Factory()
             .setUserAgent(desktopUserAgent)
             .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://www.tiktok.com/"))
-        val resolving = ResolvingDataSource.Factory(
-            http,
-            ResolvingDataSource.Resolver { dataSpec ->
-                val cookie = CookieManager.getInstance().getCookie(dataSpec.uri.toString())
-                if (cookie.isNullOrEmpty()) dataSpec
-                else dataSpec.withAdditionalHeaders(mapOf("Cookie" to cookie))
-            }
-        )
-        player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(resolving))
-            .build()
-        player.repeatMode = Player.REPEAT_MODE_ONE
-        player.setVideoSurfaceView(surface)
-        player.addListener(object : Player.Listener {
-            override fun onVideoSizeChanged(videoSize: VideoSize) {
-                fitVideo(videoSize)
-            }
-
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                refreshUi()
-            }
-
-            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                pauseIcon.visibility =
-                    if (!playWhenReady && nativeActive && items.isNotEmpty()) View.VISIBLE else View.GONE
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                loadingView.visibility =
-                    if (playbackState == Player.STATE_READY) View.GONE else View.VISIBLE
-                if (playbackState == Player.STATE_READY) hideSplash()
-            }
-
-            override fun onPlayerError(error: PlaybackException) {
-                toast("Video nicht abspielbar – nächstes")
-                if (player.hasNextMediaItem()) {
-                    player.seekToNextMediaItem()
-                    player.prepare()
-                }
-            }
-        })
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            mediaPlaybackRequiresUserGesture = true
-            userAgentString = desktopUserAgent
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            setSupportZoom(false)
-            cacheMode = WebSettings.LOAD_DEFAULT
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        }
-
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(webView, true)
-        }
-
-        webView.addJavascriptInterface(Bridge(), "AndroidBridge")
-
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            WebViewCompat.addDocumentStartJavaScript(webView, hookJs, setOf("https://www.tiktok.com"))
-        }
-
-        webView.webChromeClient = WebChromeClient()
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                view.evaluateJavascript(hookJs, null)
-            }
-
-            override fun onPageFinished(view: WebView, url: String?) {
-                CookieManager.getInstance().flush()
-                view.evaluateJavascript(hookJs, null)
-                view.evaluateJavascript(loginJs, null)
-                updateMode(url)
-                handler.postDelayed({ hideSplashIfWeb() }, 1500)
-            }
-
-            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
-                updateMode(url)
-            }
-
-            override fun shouldInterceptRequest(
-                view: WebView,
-                request: WebResourceRequest
-            ): WebResourceResponse? {
-                if (blockWebVideo && nativeActive) {
-                    val u = request.url.toString()
-                    if (u.contains("/video/tos/")) {
-                        return WebResourceResponse(
-                            "text/plain", "utf-8", 403, "Blocked",
-                            emptyMap<String, String>(), ByteArrayInputStream(ByteArray(0))
-                        )
-                    }
-                }
-                return super.shouldInterceptRequest(view, request)
-            }
-        }
-    }
-
-    // ---------- Videoliste ----------
-
-    private fun addItems(json: String) {
-        try {
-            val arr = JSONArray(json)
-            var firstAdded = items.isEmpty()
-            for (n in 0 until arr.length()) {
-                val o = arr.getJSONObject(n)
-                val id = o.optString("i")
-                val url = o.optString("u")
-                if (id.isEmpty() || !url.startsWith("https://") || seen.contains(id)) continue
-                seen.add(id)
-                items.add(
-                    Item(
-                        id, o.optString("a"), o.optString("d"), o.optString("v"),
-                        o.optLong("l"), o.optLong("c"), o.optLong("k"), o.optLong("s"),
-                        o.optBoolean("g"), o.optBoolean("b")
-                    )
-                )
-                player.addMediaItem(MediaItem.fromUri(url))
-            }
-            if (firstAdded && items.isNotEmpty()) {
-                firstAdded = false
-                player.prepare()
-                player.playWhenReady = nativeActive
-                refreshUi()
-            }
-        } catch (e: Exception) {
-            toast("Datenfehler: " + e.message)
-        }
-    }
-
-    private fun resetFeed() {
-        hideCommentsPanel()
-        pagePanelOpen = false
-        exitActionMode()
-        items.clear()
-        seen.clear()
-        player.stop()
-        player.clearMediaItems()
-        loadingView.visibility = View.VISIBLE
-        reloadedOnce = false
-        tvAuthor.text = ""
-        tvDesc.text = ""
-        tvLikeCount.text = ""
-        tvComCount.text = ""
-        tvSaveCount.text = ""
-        tvShrCount.text = ""
-        avatar.setImageDrawable(null)
-        currentAvatarUrl = ""
-    }
-
-    // ---------- Oberfläche ----------
-
-    private fun fmt(n: Long): String = when {
-        n >= 1_000_000 -> String.format(Locale.US, "%.1fM", n / 1_000_000.0)
-        n >= 1_000 -> String.format(Locale.US, "%.1fK", n / 1_000.0)
-        else -> n.toString()
-    }
-
-    private fun refreshUi() {
-        val it = items.getOrNull(player.currentMediaItemIndex) ?: return
-        tvAuthor.text = if (it.author.isEmpty()) "" else "@" + it.author
-        tvDesc.text = it.desc
-        tvLikeCount.text = fmt(it.likes)
-        tvComCount.text = fmt(it.comments)
-        tvSaveCount.text = fmt(it.collects)
-        tvShrCount.text = fmt(it.shares)
-        heartIcon.tint = if (it.liked) likedColor else Color.WHITE
-        saveIcon.tint = if (it.saved) savedColor else Color.WHITE
-        progressFill.scaleX = 0f
-        loadAvatar(it.avatar)
-    }
-
-    private fun loadAvatar(url: String) {
-        currentAvatarUrl = url
-        if (url.isEmpty()) {
-            avatar.setImageDrawable(null)
-            return
-        }
-        val cached = avatarCache[url]
-        if (cached != null) {
-            avatar.setImageBitmap(cached)
-            return
-        }
-        avatar.setImageDrawable(null)
-        Thread {
-            try {
-                val c = URL(url).openConnection() as HttpURLConnection
-                c.setRequestProperty("User-Agent", desktopUserAgent)
-                c.connectTimeout = 8000
-                c.readTimeout = 8000
-                val bmp = BitmapFactory.decodeStream(c.inputStream)
-                if (bmp != null) {
-                    avatarCache[url] = bmp
-                    runOnUiThread {
-                        if (currentAvatarUrl == url) avatar.setImageBitmap(bmp)
-                    }
-                }
-            } catch (e: Exception) {
-                // Profilbild bleibt einfach leer
-            }
-        }.start()
-    }
-
-    private fun fitVideo(vs: VideoSize) {
-        if (vs.width == 0 || vs.height == 0) return
-        val ratio = vs.width * vs.pixelWidthHeightRatio / vs.height
-        val vw: Int
-        val vh: Int
-        if (ratio >= screenW.toFloat() / screenH) {
-            vw = screenW
-            vh = (screenW / ratio).toInt()
-        } else {
-            vh = screenH
-            vw = (screenH * ratio).toInt()
-        }
-        surface.layoutParams = FrameLayout.LayoutParams(vw, vh, Gravity.CENTER)
-
-        val side = (screenW - vw) / 2
-        val roomy = side >= dp(260)
-        roomForSidebar = side >= dp(90)
-        updateSidebarVisibility()
-
-        // Bedienelemente rechts neben dem Video (bei Querformat im Bild)
-        rightCol.layoutParams = FrameLayout.LayoutParams(
-            dp(90), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.BOTTOM
-        ).apply {
-            marginStart = if (roomy) side + vw + dp(16) else maxOf(0, side + vw - dp(100))
-            bottomMargin = dp(24)
-        }
-
-        // Name und Beschreibung links neben dem Video (bei Querformat im Bild)
-        meta.layoutParams = FrameLayout.LayoutParams(
-            if (roomy) side - dp(100) - dp(24) else maxOf(dp(200), vw - dp(140)),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.START or Gravity.BOTTOM
-        ).apply {
-            marginStart = if (roomy) dp(100) else side + dp(24)
-            bottomMargin = dp(36)
-        }
-    }
-
-    private fun updateSidebarVisibility() {
-        sidebar.visibility = if (menuOpen || roomForSidebar) View.VISIBLE else View.GONE
-    }
-
-    private val progressTicker = object : Runnable {
-        override fun run() {
-            if (nativeActive) {
-                val d = player.duration
-                if (d > 0) progressFill.scaleX = (player.currentPosition.toFloat() / d).coerceIn(0f, 1f)
-            }
-            handler.postDelayed(this, 500)
-        }
-    }
-
-    private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-    }
-
-    private fun showHeartPop() {
-        heartPop.animate().cancel()
-        heartPop.scaleX = 0.6f
-        heartPop.scaleY = 0.6f
-        heartPop.alpha = 1f
-        heartPop.animate().scaleX(1.15f).scaleY(1.15f).alpha(0f).setDuration(700).start()
-    }
-
-    // ---------- Symbole rechts auswählen ----------
-
-    private fun renderActions() {
-        for (i in actionCells.indices) {
-            actionCells[i].background = if (actionMode && i == actionIdx) pill() else null
-        }
-    }
-
-    private fun enterActionMode() {
-        actionMode = true
-        actionIdx = 0
-        scheduleActionExit()
-        renderActions()
-    }
-
-    private fun exitActionMode() {
-        actionMode = false
-        handler.removeCallbacks(actionTimeout)
-        renderActions()
-    }
-
-    private fun scheduleActionExit() {
-        handler.removeCallbacks(actionTimeout)
-        handler.postDelayed(actionTimeout, 6000)
-    }
-
-    private fun handleActionKey(code: Int) {
-        scheduleActionExit()
-        when (code) {
-            KeyEvent.KEYCODE_DPAD_UP -> {
-                if (actionIdx > 0) actionIdx--
-            }
-            KeyEvent.KEYCODE_DPAD_DOWN -> {
-                if (actionIdx < actionCells.size - 1) actionIdx++
-            }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_BACK -> {
-                exitActionMode()
-                return
-            }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                when (actionIdx) {
-                    0 -> likeCurrent(false)
-                    1 -> {
-                        exitActionMode()
-                        openComments()
-                        return
-                    }
-                    2 -> saveCurrent()
-                }
-            }
-        }
-        renderActions()
-    }
-
-    // ---------- Kommentare ----------
-
-    private fun addCommentMessage(msg: String) {
-        commentList.removeAllViews()
-        val tv = label(16f)
-        tv.text = msg
-        tv.setTextColor(Color.argb(190, 255, 255, 255))
-        commentList.addView(tv)
-    }
-
-    private fun openComments() {
-        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
-        commentsOpen = true
-        commentGot = false
-        commentRetried = false
-        commentTitle.text = "Kommentare (" + fmt(item.comments) + ")"
-        addCommentMessage("Lädt Kommentare …")
-        commentPanel.visibility = View.VISIBLE
-        commentScroll.scrollTo(0, 0)
-        pagePanelOpen = true
-        clickPage("comment") { r ->
-            if (r == null || !r.contains("ok")) {
-                handler.removeCallbacks(commentTimeout)
-                addCommentMessage("Kommentare nicht verfügbar " + (r ?: ""))
-            }
-        }
-        handler.removeCallbacks(commentTimeout)
-        handler.postDelayed(commentTimeout, 7000)
-    }
-
-    private fun checkComments() {
-        if (!commentsOpen || commentGot) return
-        if (!commentRetried) {
-            commentRetried = true
-            clickPage("comment")
-            handler.postDelayed(commentTimeout, 6000)
-        } else {
-            addCommentMessage("Keine Kommentare geladen")
-        }
-    }
-
-    private fun showComments(json: String) {
-        if (!commentsOpen) return
-        commentGot = true
-        handler.removeCallbacks(commentTimeout)
-        try {
-            val arr = JSONArray(json)
-            if (arr.length() == 0) {
-                addCommentMessage("Noch keine Kommentare")
-                return
-            }
-            commentList.removeAllViews()
-            for (n in 0 until arr.length()) {
-                val o = arr.getJSONObject(n)
-                val box = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(0, dp(10), 0, dp(10))
-                }
-                val name = label(14f, true)
-                name.text = o.optString("n")
-                name.setTextColor(Color.argb(190, 255, 255, 255))
-                val text = label(16f)
-                text.text = o.optString("t")
-                val likes = label(13f)
-                val replies = o.optLong("r")
-                likes.text = "♥ " + fmt(o.optLong("l")) + (if (replies > 0) "     " + replies + " Antworten" else "")
-                likes.setTextColor(Color.argb(150, 255, 255, 255))
-                box.addView(name)
-                box.addView(text)
-                box.addView(likes)
-                commentList.addView(box, LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-                ))
-            }
-            commentScroll.scrollTo(0, 0)
-        } catch (e: Exception) {
-            addCommentMessage("Kommentarfehler")
-        }
-    }
-
-    private fun hideCommentsPanel() {
-        commentsOpen = false
-        handler.removeCallbacks(commentTimeout)
-        commentPanel.visibility = View.GONE
-    }
-
-    private fun closeComments() {
-        if (!commentsOpen) return
-        hideCommentsPanel()
-        if (pagePanelOpen) {
-            pagePanelOpen = false
-            clickPage("comment")
-        }
-    }
-
-    // ---------- Menü (Menü-Taste) ----------
-
-    private fun activeTab(): Int = if (onSearch) 2 else if (onFollowing) 1 else 0
-
-    private fun renderMenu() {
-        val active = activeTab()
-        for (i in topTexts.indices) {
-            topTexts[i].setTextColor(if (i == active) Color.WHITE else Color.argb(170, 255, 255, 255))
-            topLines[i].visibility = if (i == active) View.VISIBLE else View.INVISIBLE
-            topCells[i].background = if (menuOpen && menuZone == 0 && i == topIdx) pill() else null
-        }
-        for (i in sideRows.indices) {
-            sideRows[i].background = if (menuOpen && menuZone == 1 && i == sideIdx) pill() else null
-            sideLabels[i].visibility = if (menuOpen) View.VISIBLE else View.GONE
-            sideRows[i].gravity = if (menuOpen) (Gravity.START or Gravity.CENTER_VERTICAL) else Gravity.CENTER
-        }
-        topBar.background = if (menuOpen) GradientDrawable().apply {
-            cornerRadius = dp(30).toFloat()
-            setColor(Color.argb(190, 0, 0, 0))
-        } else null
-        sidebar.setBackgroundColor(if (menuOpen) Color.argb(215, 0, 0, 0) else Color.TRANSPARENT)
-        val lp = sidebar.layoutParams as FrameLayout.LayoutParams
-        lp.width = if (menuOpen) dp(250) else dp(72)
-        sidebar.layoutParams = lp
-        updateSidebarVisibility()
-    }
-
-    private fun openMenu() {
-        menuOpen = true
-        menuZone = 0
-        topIdx = activeTab()
-        sideIdx = 0
-        scheduleMenuClose()
-        renderMenu()
-    }
-
-    private fun closeMenu() {
-        menuOpen = false
-        handler.removeCallbacks(menuTimeout)
-        renderMenu()
-    }
-
-    private fun scheduleMenuClose() {
-        handler.removeCallbacks(menuTimeout)
-        handler.postDelayed(menuTimeout, 10000)
-    }
-
-    private fun handleMenuKey(code: Int) {
-        scheduleMenuClose()
-        when (code) {
-            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_MENU -> {
-                closeMenu()
-                return
-            }
-            KeyEvent.KEYCODE_DPAD_LEFT -> {
-                if (menuZone == 0) {
-                    if (topIdx > 0) topIdx-- else menuZone = 1
-                }
-            }
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                if (menuZone == 0) {
-                    if (topIdx < topCells.size - 1) topIdx++
-                } else {
-                    menuZone = 0
-                }
-            }
-            KeyEvent.KEYCODE_DPAD_DOWN -> {
-                if (menuZone == 0) {
-                    menuZone = 1
-                    sideIdx = 0
-                } else if (sideIdx < sideRows.size - 1) {
-                    sideIdx++
-                }
-            }
-            KeyEvent.KEYCODE_DPAD_UP -> {
-                if (menuZone == 1) {
-                    if (sideIdx > 0) sideIdx-- else menuZone = 0
-                }
-            }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                activateMenu()
-                return
-            }
-        }
-        renderMenu()
-    }
-
-    private fun activateMenu() {
-        val zone = menuZone
-        val top = topIdx
-        val side = sideIdx
-        closeMenu()
-        if (zone == 0) {
-            when (top) {
-                0 -> openFeed(feedUrl, "Für dich")
-                1 -> openFeed(followingUrl, "Folge ich")
-                2 -> showSearchDialog()
-            }
-        } else {
-            when (side) {
-                0 -> toggleMute()
-                1 -> reloadFeed()
-                2 -> logout()
-                3 -> finish()
-            }
-        }
-    }
-
-    private fun openFeed(url: String, name: String) {
-        resetFeed()
-        onSearch = false
-        webView.loadUrl(url)
-        toast(name)
-    }
-
-    private fun reloadFeed() {
-        resetFeed()
-        webView.reload()
-        toast("Lädt neu …")
-    }
-
-    private fun logout() {
-        CookieManager.getInstance().removeAllCookies(null)
-        CookieManager.getInstance().flush()
-        resetFeed()
-        setNative(false)
-        webView.clearCache(true)
-        webView.loadUrl(startUrl)
-        toast("Abgemeldet")
-    }
-
-    private fun showSearchDialog() {
-        val input = EditText(this).apply {
-            hint = "Suchbegriff"
-            setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_SEARCH
-            typeface = fontRegular
-            setPadding(dp(24), dp(16), dp(24), dp(16))
-        }
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("Suche")
-            .setView(input)
-            .setPositiveButton("Suchen") { _, _ -> doSearch(input.text.toString()) }
-            .setNegativeButton("Abbrechen", null)
-            .create()
-        input.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                dlg.dismiss()
-                doSearch(input.text.toString())
-                true
-            } else {
-                false
-            }
-        }
-        dlg.show()
-    }
-
-    private fun doSearch(query: String) {
-        val q = query.trim()
-        if (q.isEmpty()) return
-        resetFeed()
-        onSearch = true
-        webView.loadUrl("https://www.tiktok.com/search/video?q=" + URLEncoder.encode(q, "UTF-8"))
-        toast("Suche: " + q)
-    }
-
-    // ---------- Modus ----------
-
-    private fun updateMode(url: String?) {
-        if (url == null || !url.contains("tiktok.com")) return
-        val isLogin = url.contains("/login")
-        val isRoot = url.trimEnd('/') == "https://www.tiktok.com"
-        if (!isLogin && isRoot) {
-            webView.loadUrl(feedUrl)
-            return
-        }
-        onFollowing = url.contains("tiktok.com/following")
-        onSearch = url.contains("tiktok.com/search")
-        renderMenu()
-        val isFeed = url.contains("tiktok.com/foryou") || onFollowing || onSearch
-        setNative(isFeed)
-    }
-
-    private fun setNative(on: Boolean) {
-        if (on == nativeActive) return
-        nativeActive = on
-        if (on) {
-            webView.alpha = 0f
-            playerLayer.visibility = View.VISIBLE
-            webView.requestFocus()
-            player.playWhenReady = true
-            if (!hintShownOnce) {
-                hintShownOnce = true
-                showHint()
-            }
-            handler.postDelayed({
-                if (nativeActive && items.isEmpty()) {
-                    if (!reloadedOnce) {
-                        reloadedOnce = true
-                        toast("Keine Videos empfangen – lade neu")
-                        webView.reload()
-                    } else {
-                        toast("Keine Videos empfangen")
-                    }
-                }
-            }, 15000)
-        } else {
-            webView.alpha = 1f
-            playerLayer.visibility = View.GONE
-            player.playWhenReady = false
-            menuOpen = false
-            hideCommentsPanel()
-            exitActionMode()
-        }
-    }
-
-    private fun hideSplashIfWeb() {
-        if (!nativeActive) hideSplash()
-    }
-
-    private fun hideSplash() {
-        if (splashGone) return
-        splashGone = true
-        splash.animate().alpha(0f).setDuration(400)
-            .withEndAction { splash.visibility = View.GONE }
-            .start()
-    }
-
-    private fun showHint() {
-        handler.removeCallbacks(hideHint)
-        hint.animate().cancel()
-        hint.alpha = 1f
-        handler.postDelayed(hideHint, 8000)
-    }
-
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun hideSystemBars() {
-        window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-    }
-
-    // ---------- Fernbedienung ----------
-
-    // Hält die unsichtbare Seite synchron, damit TikTok weitere Videos nachlädt
-    private fun sendToPage(keyCode: Int) {
-        webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-        webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
-    }
-
-    // Klickt ein Symbol (like / comment / save) des aktuellen Videos auf der unsichtbaren Seite
-    private fun clickPage(kind: String, cb: ((String?) -> Unit)? = null) {
-        val id = items.getOrNull(player.currentMediaItemIndex)?.id ?: ""
-        webView.evaluateJavascript(
-            "window.__tvClick ? window.__tvClick('" + kind + "','" + id + "') : 'nofn';"
-        ) { r -> cb?.invoke(r) }
-    }
-
-    private fun nextVideo() {
-        if (player.hasNextMediaItem()) {
-            player.seekToNextMediaItem()
-            player.playWhenReady = true
-        } else {
-            toast("Lädt weitere Videos …")
-        }
-        sendToPage(KeyEvent.KEYCODE_DPAD_DOWN)
-    }
-
-    private fun previousVideo() {
-        if (player.hasPreviousMediaItem()) {
-            player.seekToPreviousMediaItem()
-            player.playWhenReady = true
-            sendToPage(KeyEvent.KEYCODE_DPAD_UP)
-        }
-    }
-
-    // onlyLike = true (Doppelklick): liked nur, nimmt ein bestehendes Like nicht zurück
-    private fun likeCurrent(onlyLike: Boolean) {
-        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
-        if (onlyLike && item.liked) {
-            showHeartPop()
-            return
-        }
-        clickPage("like") { r ->
-            if (r != null && r.contains("ok")) {
-                item.liked = !item.liked
-                item.likes += if (item.liked) 1 else -1
-                if (item.liked) showHeartPop()
-                if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
-            } else {
-                toast("Gefällt mir nicht möglich " + (r ?: ""))
-            }
-        }
-    }
-
-    private fun saveCurrent() {
-        val item = items.getOrNull(player.currentMediaItemIndex) ?: return
-        clickPage("save") { r ->
-            if (r != null && r.contains("ok")) {
-                item.saved = !item.saved
-                item.collects += if (item.saved) 1 else -1
-                toast(if (item.saved) "Gespeichert" else "Aus Gespeicherten entfernt")
-                if (items.getOrNull(player.currentMediaItemIndex) === item) refreshUi()
-            } else {
-                toast("Speichern nicht möglich " + (r ?: ""))
-            }
-        }
-    }
-
-    private fun toggleMute() {
-        if (player.volume > 0f) {
-            player.volume = 0f
-            toast("Ton aus")
-        } else {
-            player.volume = 1f
-            toast("Ton an")
-        }
-    }
-
-    private fun seekBy(ms: Long) {
-        player.seekTo(maxOf(0L, player.currentPosition + ms))
-    }
-
-    private fun onCenterPressed() {
-        val pending = centerPending
-        if (pending != null) {
-            // Zweiter Druck innerhalb des Zeitfensters: Gefällt mir statt Pause
-            handler.removeCallbacks(pending)
-            centerPending = null
-            likeCurrent(true)
-        } else {
-            val r = Runnable {
-                centerPending = null
-                player.playWhenReady = !player.playWhenReady
-            }
-            centerPending = r
-            handler.postDelayed(r, doubleClickMs)
-        }
-    }
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val code = event.keyCode
-        val down = event.action == KeyEvent.ACTION_DOWN
-
-        if (nativeActive) {
-            if (menuOpen) {
-                if (down) handleMenuKey(code)
-                return true
-            }
-            if (commentsOpen) {
-                if (down) {
-                    when (code) {
-                        KeyEvent.KEYCODE_DPAD_DOWN -> commentScroll.smoothScrollBy(0, dp(180))
-                        KeyEvent.KEYCODE_DPAD_UP -> commentScroll.smoothScrollBy(0, -dp(180))
-                        KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_MENU -> closeComments()
-                    }
-                }
-                return true
-            }
-            if (actionMode) {
-                when (code) {
-                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
-                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
-                    KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
-                    KeyEvent.KEYCODE_BACK -> {
-                        if (down) handleActionKey(code)
-                        return true
-                    }
-                }
-            }
-            when (code) {
-                KeyEvent.KEYCODE_MENU -> {
-                    if (down) openMenu()
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_DOWN -> { if (down) nextVideo(); return true }
-                KeyEvent.KEYCODE_DPAD_UP -> { if (down) previousVideo(); return true }
-                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                    if (down && event.repeatCount == 0) onCenterPressed()
-                    return true
-                }
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY,
-                KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                    if (down) player.playWhenReady = !player.playWhenReady
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> { if (down) enterActionMode(); return true }
-                KeyEvent.KEYCODE_DPAD_LEFT -> { if (down) toggleMute(); return true }
-                KeyEvent.KEYCODE_MEDIA_REWIND -> { if (down) seekBy(-10000); return true }
-                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (down) seekBy(10000); return true }
-                KeyEvent.KEYCODE_BACK -> {
-                    if (down) finish()
-                    return true
-                }
-            }
-        }
-        return super.dispatchKeyEvent(event)
-    }
-
-    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
-    override fun onBackPressed() {
-        if (!nativeActive && webView.canGoBack()) webView.goBack() else super.onBackPressed()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        CookieManager.getInstance().flush()
-        player.playWhenReady = false
-        webView.onPause()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        webView.onResume()
-        if (nativeActive) player.playWhenReady = true
-    }
-
-    override fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
-        player.release()
-        webView.destroy()
-        super.onDestroy()
-    }
-}
-
-// Selbst gezeichnete Symbole im Stil deiner Vorlage
-class IconView(context: Context, private val kind: Int) : View(context) {
-
-    companion object {
-        const val HEART = 0
-        const val COMMENT = 1
-        const val SHARE = 2
-        const val PLUS_BADGE = 3
-        const val PERSON = 4
-        const val SEARCH = 5
-        const val SPEAKER = 6
-        const val REFRESH = 7
-        const val POWER = 8
-        const val LOGO = 9
-        const val PLAY = 10
-        const val BOOKMARK = 11
-    }
-
-    var tint: Int = Color.WHITE
-        set(value) {
-            field = value
-            invalidate()
-        }
-
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val path = Path()
-    private val rect = RectF()
-
-    private fun fill(c: Int) {
-        paint.style = Paint.Style.FILL
-        paint.color = c
-    }
-
-    private fun stroke(c: Int, sw: Float) {
-        paint.style = Paint.Style.STROKE
-        paint.color = c
-        paint.strokeWidth = sw
-        paint.strokeCap = Paint.Cap.ROUND
-        paint.strokeJoin = Paint.Join.ROUND
-    }
-
-    private fun note(canvas: Canvas, w: Float, h: Float, dx: Float, color: Int) {
-        stroke(color, 0.12f * w)
-        canvas.drawLine(0.58f * w + dx, 0.14f * h, 0.58f * w + dx, 0.68f * h, paint)
-        path.reset()
-        path.moveTo(0.58f * w + dx, 0.14f * h)
-        path.quadTo(0.66f * w + dx, 0.34f * h, 0.88f * w + dx, 0.34f * h)
-        canvas.drawPath(path, paint)
-        fill(color)
-        canvas.drawCircle(0.4f * w + dx, 0.72f * h, 0.17f * w, paint)
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val w = width.toFloat()
-        val h = height.toFloat()
-
-        when (kind) {
-            HEART -> {
-                fill(tint)
-                val s = w / 20f
-                val oy = (h - 18.35f * s) / 2f
-                fun px(x: Float): Float = (x - 2f) * s
-                fun py(y: Float): Float = (y - 3f) * s + oy
-                path.reset()
-                path.moveTo(px(12f), py(21.35f))
-                path.lineTo(px(10.55f), py(20.03f))
-                path.cubicTo(px(5.4f), py(15.36f), px(2f), py(12.28f), px(2f), py(8.5f))
-                path.cubicTo(px(2f), py(5.42f), px(4.42f), py(3f), px(7.5f), py(3f))
-                path.cubicTo(px(9.24f), py(3f), px(10.91f), py(3.81f), px(12f), py(5.09f))
-                path.cubicTo(px(13.09f), py(3.81f), px(14.76f), py(3f), px(16.5f), py(3f))
-                path.cubicTo(px(19.58f), py(3f), px(22f), py(5.42f), px(22f), py(8.5f))
-                path.cubicTo(px(22f), py(12.28f), px(18.6f), py(15.36f), px(13.45f), py(20.04f))
-                path.close()
-                canvas.drawPath(path, paint)
-            }
-            COMMENT -> {
-                fill(tint)
-                canvas.drawCircle(0.5f * w, 0.46f * h, 0.4f * w, paint)
-                path.reset()
-                path.moveTo(0.55f * w, 0.8f * h)
-                path.lineTo(0.84f * w, 0.96f * h)
-                path.lineTo(0.8f * w, 0.66f * h)
-                path.close()
-                canvas.drawPath(path, paint)
-                fill(Color.rgb(35, 35, 35))
-                canvas.drawCircle(0.3f * w, 0.46f * h, 0.055f * w, paint)
-                canvas.drawCircle(0.5f * w, 0.46f * h, 0.055f * w, paint)
-                canvas.drawCircle(0.7f * w, 0.46f * h, 0.055f * w, paint)
-            }
-            BOOKMARK -> {
-                path.reset()
-                path.moveTo(0.26f * w, 0.12f * h)
-                path.lineTo(0.74f * w, 0.12f * h)
-                path.lineTo(0.74f * w, 0.88f * h)
-                path.lineTo(0.5f * w, 0.66f * h)
-                path.lineTo(0.26f * w, 0.88f * h)
-                path.close()
-                fill(tint)
-                canvas.drawPath(path, paint)
-                stroke(tint, 0.06f * w)
-                canvas.drawPath(path, paint)
-            }
-            SHARE -> {
-                fill(tint)
-                path.reset()
-                path.moveTo(0.6f * w, 0.1f * h)
-                path.lineTo(0.96f * w, 0.46f * h)
-                path.lineTo(0.6f * w, 0.82f * h)
-                path.lineTo(0.6f * w, 0.62f * h)
-                path.cubicTo(0.3f * w, 0.6f * h, 0.15f * w, 0.74f * h, 0.07f * w, 0.92f * h)
-                path.cubicTo(0.07f * w, 0.52f * h, 0.28f * w, 0.32f * h, 0.6f * w, 0.3f * h)
-                path.close()
-                canvas.drawPath(path, paint)
-            }
-            PLUS_BADGE -> {
-                fill(Color.rgb(254, 44, 85))
-                canvas.drawCircle(0.5f * w, 0.5f * h, 0.5f * w, paint)
-                stroke(Color.WHITE, 0.11f * w)
-                canvas.drawLine(0.28f * w, 0.5f * h, 0.72f * w, 0.5f * h, paint)
-                canvas.drawLine(0.5f * w, 0.28f * h, 0.5f * w, 0.72f * h, paint)
-            }
-            PERSON -> {
-                stroke(tint, 0.09f * w)
-                canvas.drawCircle(0.5f * w, 0.3f * h, 0.17f * w, paint)
-                rect.set(0.18f * w, 0.56f * h, 0.82f * w, 1.2f * h)
-                canvas.drawArc(rect, 180f, 180f, false, paint)
-            }
-            SEARCH -> {
-                stroke(tint, 0.1f * w)
-                canvas.drawCircle(0.42f * w, 0.42f * h, 0.25f * w, paint)
-                canvas.drawLine(0.6f * w, 0.6f * h, 0.85f * w, 0.85f * h, paint)
-            }
-            SPEAKER -> {
-                fill(tint)
-                canvas.drawRect(0.1f * w, 0.4f * h, 0.3f * w, 0.6f * h, paint)
-                path.reset()
-                path.moveTo(0.28f * w, 0.4f * h)
-                path.lineTo(0.52f * w, 0.2f * h)
-                path.lineTo(0.52f * w, 0.8f * h)
-                path.lineTo(0.28f * w, 0.6f * h)
-                path.close()
-                canvas.drawPath(path, paint)
-                stroke(tint, 0.08f * w)
-                rect.set(0.35f * w, 0.3f * h, 0.75f * w, 0.7f * h)
-                canvas.drawArc(rect, -50f, 100f, false, paint)
-                rect.set(0.3f * w, 0.16f * h, 0.92f * w, 0.84f * h)
-                canvas.drawArc(rect, -50f, 100f, false, paint)
-            }
-            REFRESH -> {
-                stroke(tint, 0.1f * w)
-                rect.set(0.2f * w, 0.2f * h, 0.8f * w, 0.8f * h)
-                canvas.drawArc(rect, -60f, 280f, false, paint)
-                // Pfeilspitze am Ende des Bogens
-                val px = 0.27f * w
-                val py = 0.307f * h
-                val dx = 0.643f
-                val dy = -0.766f
-                val tipX = px + dx * 0.16f * w
-                val tipY = py + dy * 0.16f * h
-                val nx = -dy
-                val ny = dx
-                fill(tint)
-                path.reset()
-                path.moveTo(tipX, tipY)
-                path.lineTo(px + nx * 0.13f * w, py + ny * 0.13f * h)
-                path.lineTo(px - nx * 0.13f * w, py - ny * 0.13f * h)
-                path.close()
-                canvas.drawPath(path, paint)
-            }
-            POWER -> {
-                stroke(tint, 0.1f * w)
-                rect.set(0.2f * w, 0.22f * h, 0.8f * w, 0.82f * h)
-                canvas.drawArc(rect, -60f, 300f, false, paint)
-                canvas.drawLine(0.5f * w, 0.1f * h, 0.5f * w, 0.5f * h, paint)
-            }
-            LOGO -> {
-                note(canvas, w, h, -0.03f * w, Color.rgb(37, 244, 238))
-                note(canvas, w, h, 0.03f * w, Color.rgb(254, 44, 85))
-                note(canvas, w, h, 0f, Color.WHITE)
-            }
-            PLAY -> {
-                fill(tint)
-                path.reset()
-                path.moveTo(0.25f * w, 0.15f * h)
-                path.lineTo(0.9f * w, 0.5f * h)
-                path.lineTo(0.25f * w, 0.85f * h)
-                path.close()
-                canvas.drawPath(path, paint)
-            }
-        }
-    }
-}
